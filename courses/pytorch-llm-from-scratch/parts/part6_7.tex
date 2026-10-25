@@ -1,0 +1,259 @@
+\section{Part 6 — 监督微调（SFT）}
+
+预训练让模型学会了「预测下一个 token」，但一个只会续写互联网文本的基座模型并不会自动变成助手：它不知道什么时候该回答问题、什么时候该拒绝、回答应该用什么格式。监督微调（Supervised Fine-Tuning，SFT）就是把这台「文本续写机」调成「指令助手」的阶段——用「指令 + 理想回答」的示范数据继续训练基座模型。把它放进整条流水线看：Part 2--5 训练出基座模型，Part 6 做 SFT，Part 7 训练奖励模型，Part 8 再用 PPO 做 RLHF。本节沿着代码实现走一遍 SFT 的四个关键问题：数据怎么来、对话模板怎么定、损失只算回答部分、以及如何采样与评测。
+
+\begin{knowledgebox}{SFT 在流水线中的位置}
+GPT 助手式训练分四阶段：预训练（万亿 token 互联网文本，几千张 GPU、数月）$\rightarrow$ SFT（约 1 万--10 万条专家示范，1--100 张 GPU、数天）$\rightarrow$ 奖励建模（10 万--100 万对偏好比较）$\rightarrow$ 强化学习（约 1 万--10 万条 prompt，用 RM 打分做 PPO）。SFT 的算力比预训练小几个数量级，但它决定了模型「像不像一个助手」。
+\end{knowledgebox}
+
+\subsection{6.1 工程入口：从基座 checkpoint 出发}
+
+训练脚本 \texttt{train\_sft.py} 的结构与前几个阶段一致：\texttt{orchestrator.py} 负责调度，\texttt{train\_sft.py} 负责训练，\texttt{sample\_sft.py} 负责采样评测。命令行参数直接体现 SFT 的关键配置：
+
+\begin{lstlisting}[caption={train\_sft.py 的主要命令行参数（按视频画面整理）}]
+p.add_argument('--data', type=str, default='huggingface')
+p.add_argument('--ckpt', type=str, required=False)      # 基座模型 ckpt
+p.add_argument('--out', type=str, default='runs/sft')
+p.add_argument('--steps', type=int, default=200)
+p.add_argument('--batch_size', type=int, default=8)
+p.add_argument('--block_size', type=int, default=256)
+p.add_argument('--n_layer', type=int, default=4)
+p.add_argument('--n_head', type=int, default=4)
+p.add_argument('--n_embd', type=int, default=256)
+p.add_argument('--lr', type=float, default=3e-4)
+p.add_argument('--bpe_dir', type=str, default='../part_4/runs/part4-demo/tokenizer')
+\end{lstlisting}
+
+和预训练相比，SFT 的模型结构不变，只是数据与损失变了；真正要改的是「输入怎么格式化」和「哪些 token 参与损失」。训练从 Part 5 保存的基座 checkpoint 继续，而不是从随机权重开始。
+
+\subsection{6.2 指令数据：从 instruction/input/output 到 (prompt, response)}
+
+数据侧用 \texttt{LazyTinyHF} 封装，核心数据类 \texttt{SFTExample} 只有两个字段：\texttt{prompt} 与 \texttt{response}。数据来自公开指令数据集 \texttt{tatsu-lab/alpaca}（约 5.2 万行），每行有四列：
+
+\begin{itemize}
+\item \texttt{instruction}：要求助手执行的任务；
+\item \texttt{input}：任务需要的输入（可选，例如「反转链表」的代码或列表）；
+\item \texttt{output}：期望助手给出的回答；
+\item \texttt{text}：把 instruction、input、output 拼好的完整文本（部分数据直接给现成格式）。
+\end{itemize}
+
+构造训练样本时，\textbf{prompt = instruction + input}，\textbf{response = output}；如果数据集不可用（例如断网），则回退到内置的极小样本集，保证流程能跑通。
+
+\begin{knowledgebox}{为什么先用极小数据「过拟合」}
+讲者反复强调：先用 3 条样本训练，观察损失是否下降、输出是否符合预期，再扩大数据规模。这不是为了得到好模型，而是为了验证「数据管线 + 模板 + 损失 + 采样」整条链路没有 bug——小数据过拟合是最便宜的端到端测试。
+\end{knowledgebox}
+
+此外还有一个 \texttt{LengthCurriculum} 封装：给定索引 $i$ 返回第 $i$ 个样本，配合采样器从数据集中反复取样本组 batch。名字叫「课程」，本质是一个可按索引取样的迭代器，方便后面扩展成长度分桶或课程学习。
+
+\subsection{6.3 对话模板：把 (prompt, response) 变成一段文本}
+
+模型看到的不是结构化字段，而是一段按固定模板拼好的字符串。本讲的模板是：
+
+\begin{lstlisting}[caption={SFT 对话模板（渲染后的实际字符串）}]
+'<s>\n### Instruction:\nFirst prime number\n\n### Response:\n'
+\end{lstlisting}
+
+其中 \texttt{<s>} 是序列开始 token（SOS，词表 ID 0），回答之后还会追加序列结束 token（EOS，ID 1）。两类格式化函数必须区分：
+
+\begin{itemize}
+\item \texttt{format\_example(instruction, response)}：训练用，拼出「SOS + Instruction + Response: + 回答 + EOS」的完整序列；
+\item \texttt{format\_prompt\_only(instruction)}：推理用，只拼到「Response:」为止，并把模板里可能带出的 EOS 去掉。
+\end{itemize}
+
+为什么要单独写第二个函数？训练时我们需要「输入 + 标准答案」来算损失；推理时模型只拿到用户的 prompt，答案要由它自己生成。如果把 EOS 也喂给模型当输入，模型可能从 EOS 之后继续「续写」，输出乱码——所以推理前要显式去掉 EOS。
+
+\subsection{6.4 批处理与 loss mask：只让回答参与损失}
+
+这是 SFT 实现中最容易写错、也最重要的一步。Collator（\texttt{SFTCollator}）拿到一个 batch 的 (prompt, response) 后做四件事：
+
+\begin{enumerate}
+\item 用 BPE tokenizer 分别对「格式化后的 prompt」和「完整样本」编码，得到 \texttt{prompt\_ids} 与 \texttt{full\_ids}；
+\item 令输入 $x$ 为完整序列的 token；令标签 $y$ 为 $x$ 的\textbf{右移一位}（$y_t = x_{t+1}$），这样每个位置预测的是下一个 token；
+\item 把 $y$ 中属于 prompt 的部分全部替换为 \texttt{-100}，末尾最后一位也置为 \texttt{-100}（它没有下一个 token 可预测）；
+\item 把 $x$ 用填充 token（ID 2）补齐到 \texttt{block\_size}，$y$ 对应位置补 \texttt{-100}。
+\end{enumerate}
+
+\texttt{-100} 是 PyTorch 交叉熵的默认忽略索引 \texttt{ignore\_index}：损失函数遇到它直接跳过，不产生梯度。于是 loss 只在 response 的 token 上计算——这正是我们想要的「只学怎么回答，不用学怎么复述问题」。
+
+设第 $i$ 条样本的序列长度为 $T$，response 有效位置集合为 $\mathcal{R}$（即 $y_t \neq -100$ 的位置），则 SFT 损失为
+
+$$
+\mathcal{L}_{\text{SFT}} = -\frac{1}{|\mathcal{R}|}\sum_{t\in\mathcal{R}} \log p_\theta\!\left(y_t \mid x_{<t}\right),
+$$
+
+其中 $p_\theta(y_t \mid x_{<t})$ 是模型在位置 $t$ 对「下一个 token」预测为 $y_t$ 的概率，$|\mathcal{R}|$ 是回答 token 数。直观上：把问题遮住，只对答案的每个 token 做最大似然。
+
+\begin{lstlisting}[caption={collate 中的核心逻辑（按视频解释重写，细节以仓库代码为准）}]
+# 1) 只格式化 prompt，得到 prompt 的长度
+prompt_ids = tokenizer.encode(format_prompt_only(instruction))
+full_ids   = tokenizer.encode(format_example(instruction, response))
+prompt_len = len(prompt_ids)
+
+# 2) y 是 x 的右移一位：x[t] -> y[t+1]
+x = full_ids
+y = x[1:] + [IGNORE]          # IGNORE = -100
+
+# 3) 把 prompt 对应的标签全部遮成 -100
+for t in range(prompt_len):
+    y[t] = -100
+
+# 4) 填充到 block_size：x 补 PAD(2)，y 补 -100
+x = x[:block_size] + [PAD] * (block_size - len(x))
+y = y[:block_size] + [-100] * (block_size - len(y))
+\end{lstlisting}
+
+\begin{warningbox}{这一阶段最常见的三类 bug}
+（1）忘记右移标签，导致模型被训练成「复制当前 token」；（2）mask 的边界算错一位——prompt 长度和右移后的位置必须对齐，否则问题 token 会漏进损失；（3）填充位置没有置为 \texttt{-100}，让模型花容量去预测「填充 token」。视频里讲者在写 collate 测试代码时就踩过这些坑。
+\end{warningbox}
+
+\subsection{6.5 训练循环：前向、反向与工程细节}
+
+有了 batch 的 $(x, y)$，训练就是标准循环：前向得到 logits，交叉熵（\texttt{ignore\_index=-100}）得到 loss，反向传播更新参数。讲者提到两点工程细节：这里可以开启混合精度训练（AMP），也可以做梯度累积以在有限显存下等效放大 batch；训练中每 20 步打印一次 loss，训练结束后用 \texttt{torch.save} 保存 SFT 模型。为了便于调试，整个项目配置了 VS Code 的 launch 参数，可以直接在 collator/trainer 里打断点，检查中间张量的形状与数值。
+
+\subsection{6.6 采样评测：提前停止与 KV cache 复用}
+
+训练完成后用 \texttt{sample\_sft.py} 采样：加载 SFT checkpoint、设置 block size/层数/头数/嵌入维度、最大生成 token 数、温度与 top-k；把用户 prompt 用 \texttt{format\_prompt\_only} 格式化后编码，调用模型的 \texttt{generate}，逐 token 生成直到遇到 EOS（提前停止）或达到最大长度，最后解码打印。
+
+调试 \texttt{generate} 时可以看到几个关键现象：对 logits 做 top-k/top-p 过滤后，绝大多数候选被置为 $-\infty$，概率集中到少数 token 上；第一次前向不使用 KV cache，之后每一步只输入最后一个 token、其余历史来自 KV cache（步骤 2 的 \texttt{start\_pos}=31 表示已有 31 个 token 的缓存）；一旦采样到 EOS（ID 1）就跳出循环。
+
+\begin{importantbox}{SFT 阶段可以改变上下文窗口}
+SFT 可以设置与基座模型不同的 \texttt{block\_size}。原因是注意力与位置编码的矩阵形状是通用的，同一套权重可以在不同上下文长度下继续训练。工程意义很大：基座用较小窗口（如 8K）训练以省算力，SFT 数据少（千条量级）时把窗口扩到 64K，就以很低的成本获得了长上下文能力。视频在本段专门补充说明了这一点。
+\end{importantbox}
+
+\subsection{6.7 从玩具数据到规模化：过拟合与泛化边界}
+
+先在 3 条样本上训练：损失下降、训练集内问题能答对，但样本外问题明显退化（问 DNA 生成 compass、让写程序却重复训练片段）。然后把 \texttt{sample\_dataset} 设为 False，从 Alpaca 加载 24 条数据重新训练：初始 loss 很高，随后健康下降；模型能回答训练分布内的问题（如三原色、DNA 的全称），也能输出一段代码。但请注意：这只是一个 2 层 Transformer 的玩具模型，讲者明确说它不会聪明——目的是演示生产级 SFT 的流程，而不是复现一个可用的助手。真实场景中通常是拿别人预训练好的基座（甚至指令微调过的模型）再用大量数据微调；LoRA 等参数高效微调因为网上资源丰富，在本系列中跳过（本课程坚持「从零实现每个模块」）。
+
+\begin{knowledgebox}{关于灾难性遗忘的说明}
+视频这一部分用「3 条样本过拟合、样本外退化」演示了小数据 SFT 的泛化边界，但没有单独展开灾难性遗忘（catastrophic forgetting）的系统分析。工程上可以把这里的现象当作预警：小数据、单分布、少步数的 SFT 容易让模型只记住样本；真实训练中需要监控基座模型在通用能力上的回退（例如保留一部分通用数据、控制学习率与步数、做训练前后评测）。这部分属于基于本讲实验的延伸，不是视频原文结论。
+\end{knowledgebox}
+
+\subsection{本章小结}
+\begin{enumerate}
+\item SFT 是在基座 checkpoint 上用「指令 + 回答」示范数据继续训练，把文本续写模型调成助手；算力远小于预训练，但决定交互行为。
+\item 指令数据经 \texttt{instruction/input/output} 构造为 (prompt, response)，prompt = instruction + input，response = output；先用极小数据过拟合验证管线，再扩大规模。
+\item 模板决定模型看到的文本格式。训练阶段用 \texttt{format\_example}，它包含回答与 EOS；推理阶段用 \texttt{format\_prompt\_only}，它不含回答、并去掉 EOS。
+\item loss mask 是核心：$y$ 右移一位、prompt 与填充位置置 \texttt{-100}，交叉熵只对回答 token 计损失。
+\item 采样时用 top-k/top-p 过滤、KV cache 复用与 EOS 提前停止；SFT 阶段还可以改变上下文窗口，低成本扩展长上下文能力。
+\item 小数据只用于验证管线；真实 SFT 依赖更大规模数据与更强基座，且要关注过拟合与基座能力回退风险。
+\end{enumerate}
+
+\section{Part 7 — 奖励建模}
+
+SFT 让模型「会回答问题」，但它还不会「按人类偏好回答」：同一问题可以有很多种说法，有的更中立、有的更符合某种角色、有的更安全。奖励建模（Reward Modeling）的目标是训练一个能对「(指令, 回答)」打分的模型，把人类偏好变成一个可优化的标量信号，供下一阶段的强化学习使用。本节先看它在流水线中的位置，再依次讲偏好数据、编码器式奖励模型、masked mean pooling、Bradley-Terry 损失与训练评测。
+
+\subsection{7.1 为什么需要奖励模型}
+
+RLHF 分两步：先训练奖励模型（本部分），再用它作为奖励信号做强化学习（Part 8 的 PPO）。奖励模型的输入是「指令 prompt + 一条回答」，输出一个标量分数 $r(x, y)$；训练数据不是「标准答案」，而是\textbf{偏好比较}：同一个 prompt 下两条回答，人类标注者选出更好的那条。这个阶段的数据成本更高——通常要雇佣承包商甚至领域专家（有高级学位）来保证标注质量，规模也比 SFT 数据大一些。
+
+偏好可以来自很多维度：更中立的语气、更符合设定的角色、避免政治偏见、更安全等。本质上，奖励模型学的是「人类比较两个回答时会选哪个」这一判断。
+
+\subsection{7.2 偏好数据的结构与加载}
+
+本讲使用 Anthropic 的偏好数据集 \texttt{Anthropic/hh-rlhf}：训练集约 16.1 万行，分 train/test 两个 split，每行只有两列——\texttt{chosen}（被选中的回答）与 \texttt{rejected}（被拒绝的回答）。每条样本的文本里包含完整上下文：指令、prompt，有时还有多轮对话历史，然后才是这一轮的回答。加载后把每行组织成三元组 \texttt{(prompt, task, response)}：由于 hh-rlhf 没有独立的 prompt 字段，讲者把 prompt 留空占位，instruction 与对话历史都拼在 chosen/rejected 文本中；如果换用带 prompt 字段的数据集，这个占位符可以直接复用。
+
+\begin{warningbox}{数据集差异会传导到 collator}
+hh-rlhf 没有独立的 prompt 字段，所以 pair collator 用空字符串占位；换数据集时如果它有 \texttt{prompt} 字段，把占位符替换成真实 prompt 即可。不要把「空 prompt」当成 bug——它是为兼容不同偏好数据集保留的基础框架。
+\end{warningbox}
+
+\subsection{7.3 奖励模型架构：encoder-only Transformer + scalar head}
+
+实现上采用\textbf{仅编码器（encoder-only）}的 Transformer，而不是复用解码器 LM，原因在注意力掩码：
+
+\begin{itemize}
+\item 解码器（decoder）是因果掩码，第 $t$ 个 token 只能看到前 $t$ 个 token；
+\item 编码器（encoder）没有因果掩码，每个位置都能看到整段文本——而给「指令 + 回答」整体打分时，我们希望模型能同时看到回答的开头和结尾，因此 encoder 更自然。
+\end{itemize}
+
+架构上，先把 token embedding 与 position embedding 相加，再堆叠 $N$ 层编码器层。每层直接使用 PyTorch 自带的 \texttt{torch.nn.TransformerEncoderLayer}（按「Attention is all you need」实现），之后做层归一化，最后接一个线性头，把 $d$ 维表示映射成 1 个标量。与语言模型相比，奖励模型可以小几个数量级——它不做逐 token 生成，只需要给整段文本一个偏好分数。当然也可以走另一条路：拿现成的解码器 LM，在层之后切掉 LM head，换成一个输出标量的线性头；本讲为了展示更多样的实现，选择了 encoder 路线。
+
+\begin{knowledgebox}{两种奖励模型实现怎么选}
+复用解码器 LM + 线性头：能直接继承已训练的语言能力，适合大规模场景，但需要处理因果掩码（只能看左侧）与显存。encoder-only：结构简单、双向可见全文、参数少，适合从零教学与轻量场景。两条路线在工业界都有使用，本讲选后者主要是为了「看到不同实现」。
+\end{knowledgebox}
+
+\subsection{7.4 前向：padding mask 与 masked mean pooling}
+
+设 batch 大小为 $B$、上下文长度为 $T$、隐藏维度为 $d$。前向过程与形状如下：
+
+\begin{enumerate}
+\item 输入 token ID 形状 $B\times T$；token embedding 与 position embedding 相加，得到 $B\times T\times d$；
+\item 由输入构造 padding mask（判断每个位置是否为填充 token），形状 $B\times T$。这个掩码会传给 encoder 的 \texttt{src\_key\_padding\_mask} 参数，让注意力忽略填充位置；
+\item 经过 $N$ 层 encoder 与层归一化，形状仍为 $B\times T\times d$；
+\item \textbf{masked mean pooling}：把 padding mask 扩展成 $B\times T\times 1$ 的浮点掩码，与表示逐元素相乘（填充位置的 $d$ 维向量全变 0），沿序列维求和得到 $B\times d$，再除以非填充 token 数（mask 求和）得到平均表示；
+\item 线性头把 $B\times d$ 映射成 $B\times 1$ 的偏好分数 $r$。
+\end{enumerate}
+
+设 $H\in\mathbb{R}^{B\times T\times d}$ 为 encoder 输出，$m\in\{0,1\}^{B\times T}$ 为「非填充」掩码，则第 $b$ 条样本的池化表示为
+
+$$
+h_b=\frac{\sum_{t=1}^{T} m_{b,t}\,H_{b,t}}{\sum_{t=1}^{T} m_{b,t}},
+\qquad
+r_b = w^{\top} h_b + c,
+$$
+
+其中 $H_{b,t}\in\mathbb{R}^{d}$ 是第 $t$ 个 token 的表示，$m_{b,t}=1$ 表示该位置不是填充，分母保证只对真实 token 取平均，$w\in\mathbb{R}^{d}$、$c$ 是线性头参数，$r_b$ 即该样本的标量分数。
+
+\begin{importantbox}{三个必须记住的形状}
+（1）encoder 输入/输出：$B\times T\times d$（本例 $8\times256\times128$）；（2）padding mask：$B\times T$，扩展后 $B\times T\times 1$；（3）池化后：$B\times d$，再过线性头变成 $B\times 1$。形状对不上时，优先检查 mask 的维度与广播。
+\end{importantbox}
+
+\subsection{7.5 Bradley-Terry 损失与边际排序损失}
+
+偏好建模的经典假设是 Bradley-Terry 模型：给定 prompt $x$、被选中的回答 $y_w$ 与被拒绝的回答 $y_l$，模型认为「$y_w$ 优于 $y_l$」的概率由两个奖励分数之差经过 sigmoid 得到：
+
+$$
+P(y_w \succ y_l \mid x)=\sigma\!\left(r_\theta(x,y_w)-r_\theta(x,y_l)\right),
+$$
+
+其中 $\sigma(z)=1/(1+e^{-z})$ 是 sigmoid，$r_\theta(\cdot)$ 是奖励模型输出。对应的负对数似然损失为
+
+$$
+\mathcal{L}_{\text{BT}}
+=-\log \sigma\!\left(r_\theta(x,y_w)-r_\theta(x,y_l)\right)
+=\operatorname{softplus}\!\left(-\left[r_\theta(x,y_w)-r_\theta(x,y_l)\right]\right).
+$$
+
+直观理解：当「正例分数 − 负例分数」是很大的正数时，$-\log\sigma$ 接近 0，几乎没有损失；当正例分数反而更低时，损失迅速变大。视频里用 PyTorch 的 softplus 曲线演示了这一点，并给了一个数值例子：差值为 $-0.1101$ 时损失约 $0.74$；差值足够大时损失硬性为 0。softplus 让「差距不够大」的样本也有平滑的梯度，而不是像 hinge 那样直接截断。
+
+视频还介绍了另一种排序损失——边际排序损失（Margin Ranking Loss）：
+
+$$
+\mathcal{L}_{\text{margin}}=\max\!\left(0,\,-y\,(x_1-x_2)+\text{margin}\right),
+$$
+
+其中 $x_1$ 是第一条输入的分数、$x_2$ 是第二条的分数，标签 $y=1$ 表示「第一条应该排在前面」，若 $x_1$ 确实大于 $x_2$ 则损失为 0；\texttt{margin} 是可选间隔，默认 0。它和 Bradley-Terry 的区别是 hinge（硬截断）与 softplus（平滑）的差别；本讲训练使用 Bradley-Terry，但把 margin ranking loss 也实现出来做对照。
+
+\begin{lstlisting}[caption={Bradley-Terry 损失的核心计算（按视频讲解重写）}]
+# r_pos / r_neg: 形状 (B, 1)，chosen 与 rejected 的偏好分数
+diff = r_pos - r_neg
+loss_bt = -torch.nn.functional.logsigmoid(diff).mean()
+# 等价写法：softplus(-diff) 或 BCEWithLogitsLoss(diff, ones)
+\end{lstlisting}
+
+\begin{warningbox}{标签方向写反是最隐蔽的错误}
+Bradley-Terry 里「正例减负例」的顺序、MarginRankingLoss 里 $y=1$ 的含义必须一致：chosen 在前、rejected 在后。方向写反时损失仍会下降（它会把模型训成「讨厌好回答」），但训练指标会异常。写完后先手动算一个 batch 的分数差，确认正例分数更高。
+\end{warningbox}
+
+\subsection{7.6 训练循环与评测：小数据只能验证管线}
+
+训练配置：300 步、batch size 8、上下文长度 256、2 层 encoder、2 个头、嵌入维度 128，使用 Bradley-Terry 损失，并复用 SFT 阶段的 tokenizer。每 25 步记录一次 loss；训练结束后进入评测循环：加载 checkpoint、eval 模式、batch 16，前向得到每条样本的 $r_{\text{pos}}$ 与 $r_{\text{neg}}$，若 $r_{\text{pos}}>r_{\text{neg}}$ 则判对，统计准确率。
+
+在小数据上（训练/测试各只有 8 条左右）结果大约是：训练集 75%、测试集 50%——讲者明确说这没有意义，样本太少、模型只有 2 层，奖励模型这一阶段（连同 RLHF/PPO）本来就很难收敛，不能根据这几个数字判断方法好坏；加大数据量、层数与规模后情况会不同。
+
+\begin{importantbox}{奖励模型阶段的核心结论}
+奖励模型不生成文本，只给整段「指令 + 回答」打分；它的训练目标是让 chosen 的分数高于 rejected，而不是拟合某个绝对分数。小数据上「75\% / 50\%」的准确率只能说明管线跑通，不能说明 RM 有效——这正是下一阶段 PPO 需要大量数据与工程调优的原因。
+\end{importantbox}
+
+\subsection{7.7 与 Part 8 的衔接：进入强化学习}
+
+Part 7 结束后，视频立刻进入最后一部分（RLHF + PPO）的术语铺垫，给出的术语表包括：state（当前文本上下文）、action（下一个 token）、policy（策略，即语言模型）、reward（奖励，来自 RM）、value（价值函数）、advantage（优势）、GAE（广义优势估计）、KL 散度（约束新策略不要偏离参考模型太远）等。这些概念是 Part 8 实现 PPO 的前置知识，也说明了奖励模型的用途——它给出的标量分数正是 RL 阶段的 reward。
+
+\subsection{本章小结}
+\begin{enumerate}
+\item 奖励建模是 RLHF 的第一步：用人类偏好比较数据训练一个对「(指令, 回答)」打分的模型，输出标量作为下一阶段 RL 的奖励信号。
+\item 偏好数据用 chosen/rejected 成对组织（本讲用 Anthropic/hh-rlhf，训练集约 16.1 万行）；没有独立 prompt 字段时用空占位，换数据集时可替换。
+\item 本讲实现 encoder-only 奖励模型：双向注意力可看全文，token+position embedding、堆叠 TransformerEncoderLayer、层归一化、标量线性头；参数可比语言模型小几个数量级。
+\item 前向的关键是 padding mask 与 masked mean pooling：只对非填充 token 取平均得到 $B\times d$ 表示，再映射成 $B\times 1$ 分数。
+\item 损失用 Bradley-Terry：$-\log\sigma(r_{\text{pos}}-r_{\text{neg}})$，等价于对负差值取 softplus；margin ranking loss（hinge 形式）作为对照。
+\item 评测看「chosen 分数是否高于 rejected」的准确率；小数据上的数字只能验证管线，奖励模型与 RLHF 的收敛需要更大规模数据与算力。
+\end{enumerate}

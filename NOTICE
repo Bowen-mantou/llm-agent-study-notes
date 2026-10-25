@@ -1,0 +1,23 @@
+NOTICE
+
+This repository contains original study notes and hand-written implementation
+tutorials by Bowen-mantou, plus references/links to third-party works.
+
+Third-party works referenced (not redistributed as media assets):
+- CMU 11-768 AI Agents course (Daniel Fried, Graham Neubig) and its Bilibili
+  translation by "常青藤名校课" (BV1a6Yx62EH4). Video frames/subtitles/transcripts
+  are NOT included in this repository.
+- freeCodeCamp.org "LLMs from Scratch – Practical Engineering from Base Model to
+  PPO RLHF" (YouTube p3sij8QzONQ) and its Bilibili dubbed version by "AIDeepCoder"
+  (BV1VJa869ECR). Video frames/subtitles are NOT included. Code excerpts quoted in
+  notes remain under the original code repository's GPL-3.0 license
+  (vivekkalyanarangan30/llm_from_scratch).
+- 灵茶山艾府 (灵神) algorithm course: NOT redistributed; only linked as a learning
+  reference.
+- Agentic-RL-Lab (Apache-2.0), veRL (Apache-2.0), OpenHands, SWE-agent and other
+  open-source projects are referenced as design references; their licenses apply
+  to their own code.
+- PyTorch, HuggingFace, MiKTeX and other tools are referenced with attribution.
+
+If you are a rights holder and believe content here infringes your rights, please
+open an issue — we will remove or revise it promptly.

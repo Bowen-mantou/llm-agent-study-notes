@@ -1,0 +1,16 @@
+# 文档许可（Notes License）
+
+本仓库的课程讲义、教程、笔记等文字内容（`courses/`、`handwritten/`、`interview/` 及 `projects/` 下的 `.md`/`.html`/`.tex` 文档）采用
+**Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)** 许可。
+
+你可以：共享、复制、改编，但需
+1. 署名（注明来源 `llm-agent-study-notes` 及原文作者/课程出处，见 CREDITS.md）；
+2. 非商业使用；
+3. 以相同许可分享改编作品。
+
+许可全文：<https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode>
+
+代码/脚本（`scripts/`、`projects/harness-rl/` 的代码）采用 MIT 许可，见 `LICENSE`。
+第三方内容仍适用其原始许可（见 `CREDITS.md`、`NOTICE`）。
+
+注意：`courses/pytorch-llm-from-scratch/` 中引用的代码片段来自 GPL-3.0 原始仓库，该部分按 GPL-3.0 使用（全文见同目录 `LICENSE-GPL-3.0.txt`）。

@@ -1,0 +1,40 @@
+% 总结与延伸（Lead 撰写；放在 \section{总结与延伸} 内）
+% 该文件被主 tex 用 \input 引入，不要写 \section，除非需要子节
+
+这门 6 小时课程的主线只有一句话：\textbf{把「一段文本」一步步变成一个能按人类偏好回答问题的 LLM，并亲手写出每一步的 PyTorch 实现。} 九个 Part 不是九个孤立知识点，而是一条严格的递进链：
+
+\begin{importantbox}{一条主线串起九个 Part}
+文本/分词 $\rightarrow$ Transformer 架构 $\rightarrow$ 预训练一个小模型 $\rightarrow$ 架构现代化（RMSNorm/RoPE/SwiGLU/滑窗/KV cache）$\rightarrow$ 扩展规模（混合精度/梯度累积/并行）$\rightarrow$ MoE 稀疏化 $\rightarrow$ SFT 对齐指令 $\rightarrow$ 奖励建模 $\rightarrow$ PPO RLHF。
+\end{importantbox}
+
+\subsection{五个最值得带走的结论}
+
+\begin{enumerate}
+  \item \textbf{LLM 的每一层都可以被写出来。} 从 byte-level tokenizer、带因果掩码的缩放点积注意力、多头拼接、残差 + LayerNorm，到交叉熵与反向传播，课程全部用纯 PyTorch 实现；理解“张量形状如何流动”比背公式更重要。
+  \item \textbf{现代架构的每个改动都在解决一个具体问题。} RMSNorm 去掉均值中心化以省算力；RoPE 把相对位置编码进 Q/K 旋转；SwiGLU 用门控提升 FFN 表达力；滑动窗口与 KV cache 共同决定长上下文与推理成本。判断一个改动是否值得，要回到“它解决什么、代价是什么”。
+  \item \textbf{训练工程决定能不能跑起来。} 混合精度（bf16/fp16 + loss scaling）、梯度累积（用小显存模拟大 batch）、梯度裁剪与学习率调度，是把“数学上成立”变成“工程上收敛”的关键；显存账要按 参数 + 梯度 + 优化器状态 + 激活 分开算。
+  \item \textbf{MoE 是“用稀疏换容量”。} top-k gating 让每个 token 只走少数专家，参数量上去了但计算量可控；代价是路由/负载均衡、通信、训练不稳定与推理复杂度。它不是一个免费的放大按钮。
+  \item \textbf{对齐是“三阶段流水线”，不是单个算法。} SFT 教格式与指令遵循；奖励模型把人类偏好压缩成一个标量；PPO 用奖励 + KL 约束做策略优化。每个阶段的目标、数据与失败模式都不同，混在一起讲就会得出错误结论。
+\end{enumerate}
+
+\subsection{把课程接回你的项目与面试}
+
+\begin{itemize}
+  \item \textbf{SFT 与 loss mask}：课程里 chat template + assistant-only loss 的实现，可以直接对照你在 Code-R1/Search-R1 里的轨迹构造与训练数据组织；被问“SFT 为什么只算 assistant token”时，从 mask 的构造讲起最清楚。
+  \item \textbf{奖励模型与 reward hacking}：课程对 Bradley--Terry 偏好损失、标量头、校准的讲解，可以补上“为什么过程奖励/奖励模型会被钻空子”的理论背景；结合你 verifier 门控失败（gate 18.2\%、LCB 24.8）与手写 PRM 被 hack 的经历，是一条完整叙事。
+  \item \textbf{PPO 与 GRPO}：课程给出 PPO 的 ratio/clip/advantage/KL 与 GAE 的完整推导；对照你项目里的 GRPO（组内优势、砍 critic、KL 惩罚），可以回答“为什么可验证任务用 GRPO、长程稀疏任务仍要考虑 PPO/value model”。
+  \item \textbf{MoE 与训练系统}：专家路由/负载均衡、通信开销与并行策略，和你在 09-SWE-agent 里做的 rollout/训练解耦、显存与吞吐优化是同一类工程问题；面试聊“训练系统”时可以从这里借术语。
+  \item \textbf{从零实现的价值}：面试官问“你知道 Transformer 内部长什么样吗”时，能说出每层的张量形状、参数量与计算量，比复述论文更有说服力。
+\end{itemize}
+
+\subsection{如果继续深入：三条延伸线}
+
+\begin{enumerate}
+  \item \textbf{把 tiny LLM 放大}：用课程代码在自己的数据上做一次小规模预训练（1--2 张卡），记录 loss 曲线、吞吐与显存，形成“训练工程”的第一手数据。
+  \item \textbf{把对齐做完整}：在 SFT 模型上训练奖励模型，再跑 PPO/GRPO，对比“纯 SFT vs SFT+RM+PPO”的差异，观察 KL、reward 与长度变化——这是理解 RLHF 稳定性最直接的方式。
+  \item \textbf{把 MoE 讲清楚}：实现一个最小 top-2 MoE block，测量专家利用率、负载不均衡与吞吐，回答“MoE 什么时候真的划算”。
+\end{enumerate}
+
+\begin{knowledgebox}{学习建议}
+第一遍跟着视频敲代码、跑通形状；第二遍回到本讲义，按“动机 $\rightarrow$ 机制 $\rightarrow$ 代码/公式 $\rightarrow$ 工程坑”复述每个 Part；第三遍只读各 Part 的“本章小结”和本节的五个结论，用它们回答面试里的“为什么”。
+\end{knowledgebox}

@@ -1,0 +1,346 @@
+% ============================================================
+% Part 2 — Training a Tiny LLM / Part 3 — Modernizing the Architecture
+% 本文件是讲义片段：不含 \documentclass，由主文件 \input 引入
+% 对应视频：BV1VJa869ECR（AIDeepCoder），Part 2 = 00:40:24–01:30:27，Part 3 = 01:30:27–02:33:53
+% ============================================================
+
+\section{Part 2 — 训练一个小 LLM}
+
+\subsection{本讲定位：把 Part 1 的模型真正训起来}
+
+Part 1 已经把 Transformer 的每个零件写完了；Part 2 要做的是\textbf{把这些零件组装成一条可运行的训练流水线}：从原始文本文件出发，经过字节级分词、批采样、前向与交叉熵、反向与优化器更新，最后能从一个提示词开始自回归地生成文本。
+
+讲者先展示本部分的入口 \texttt{orchestrator.py}。它本身不做训练，只负责把参数拼好、依次调用脚本。Part 2 里主要涉及三个文件：
+
+\begin{itemize}
+\item \texttt{train.py}：训练主脚本（分词器、数据集、模型、训练循环、采样都在这里串起来）；
+\item \texttt{tokenizer.py}：字节级分词器 \texttt{ByteTokenizer}；
+\item \texttt{dataset.py}：把文本文件变成可采样的 $(x,y)$ 批次。
+\end{itemize}
+
+讲者给出的运行命令（关键参数）如下（图~\ref{fig:p2-config}）：
+
+\begin{lstlisting}[caption={Part 2 的运行命令（据视频 orchestrator 传参整理）。}]
+python train.py --data tiny_hi.txt --steps 400 --sample_every 100 \
+  --eval_interval 100 --batch_size 32 --block_size 128 \
+  --n_layer 2 --n_head 2 --n_embd 128
+\end{lstlisting}
+
+注意这里的模型极小：\textbf{2 层、2 个注意力头、128 维嵌入、上下文窗口 128}——目标是把流程跑通并观察损失下降，而不是训练一个可用的模型。
+
+\begin{knowledgebox}{这一部分刻意“够用就好”}
+Part 2 的分词器、数据集、训练循环都是\textbf{最小可运行版本}：字节分词器词表只有 256、数据集一次性读进内存、模型只有 2 层。讲者反复强调这些实现“不是工业级”，目的是先建立正确的心理模型；真正的工程化（BPE、梯度累积、学习率计划、检查点恢复）放在 Part 4。
+\end{knowledgebox}
+
+\subsection{字节级分词器：每个字节就是一个 token}
+
+语言模型不直接读字符，而读整数 ID。最朴素的做法是\textbf{字节级（byte-level）分词}：把字符串按 UTF-8 编码成一串字节，每个字节（0–255）就是一个 token，因此\textbf{词表大小固定为 256}（图~\ref{fig:p2-tokenizer}）。
+
+\begin{lstlisting}[caption={字节级分词器的核心（据视频 \texttt{tokenizer.py} 整理）：编码用 UTF-8 字节，解码把字节串还原成文本。}]
+class ByteTokenizer:
+    """Ultra-simple byte-level tokenizer."""
+    @property
+    def vocab_size(self) -> int:
+        return 256
+
+    def encode(self, s: str) -> torch.Tensor:
+        return torch.tensor(list(s.encode("utf-8")), dtype=torch.long)
+
+    def decode(self, ids) -> str:
+        if isinstance(ids, torch.Tensor):
+            ids = ids.tolist()
+        return bytes(ids).decode("utf-8", errors="ignore")
+\end{lstlisting}
+
+讲者对这个分词器的评价很直接：\textbf{词表极小，但序列会变长}——一个汉字在 UTF-8 下通常占 3 个字节，也就是 3 个 token；英文大约 1 字节/token。序列变长意味着同样长度的上下文能装下的“语言内容”变少，注意力计算量也随之上升。所以它适合入门，不适合工业级应用；Part 4 会换成 BPE。
+
+\begin{warningbox}{细节坑：\texttt{errors='ignore'} 会悄悄吞掉字节}
+解码时若字节序列不完整（例如模型刚采样到某个多字节字符的前两个字节），\texttt{decode(errors='ignore')} 会\textbf{丢弃}这段字节而不报错。这在演示里没问题，但工程上要意识到：分词器的 encode/decode 不是严格可逆的，评估生成质量时可能看到“少字”。
+\end{warningbox}
+
+\subsection{数据集与批采样：随机窗口 + label shift}
+
+数据加载的路径非常直接（图~\ref{fig:p2-dataset}）：\texttt{Path.read\_bytes()} 读入整个文件，转成 \texttt{long} 张量；按 90/10 切成训练集与验证集；每次采样时，在 $[0,\ \text{len}-\text{block\_size}-1]$ 里随机取 \texttt{batch\_size} 个起点，每个起点取长度为 \texttt{block\_size} 的一段作为输入 $x$。
+
+关键在于 $y$：\textbf{它不是另做一份标签，而是同一段文本向后平移一位}。第 $i$ 个样本的 $y$ 是 $buf[i+1 : i+1+\text{block\_size}]$，于是对于 $x$ 中位置 $t$ 的 token，$y$ 中对应位置就是它的\textbf{下一个 token}——这就是语言模型训练所需的 \textbf{label shift}。
+
+\begin{lstlisting}[caption={批采样与 label shift（据视频 \texttt{dataset.py} 整理）：$y$ 是 $x$ 右移一位的同一段文本。}]
+class ByteDataset:
+    def __init__(self, path, block_size=256, split=0.9):
+        data = Path(path).read_bytes()
+        data = torch.tensor(list(data), dtype=torch.long)
+        n = int(len(data) * split)
+        self.train, self.val = data[:n], data[n:]
+        self.block_size = block_size
+
+    def get_batch(self, which, batch_size, device):
+        buf = self.train if which == "train" else self.val
+        assert len(buf) > self.block_size + 1
+        ix = torch.randint(0, len(buf) - self.block_size - 1, (batch_size,))
+        x = torch.stack([buf[i : i + self.block_size] for i in ix])
+        y = torch.stack([buf[i + 1 : i + 1 + self.block_size] for i in ix])
+        return x.to(device), y.to(device)
+\end{lstlisting}
+
+讲者在解释随机起点时特意强调了“为什么上界要减 1”：如果不留缓冲区，当随机到接近文件末尾的位置时，$i+\text{block\_size}$ 会越界；同理 $y$ 要额外多取一位，所以上界再减 1。这个细节后面会在“模型输出为什么右移一位”处再次用到。
+
+\begin{warningbox}{这个数据集实现不能直接用于大规模数据}
+讲者明确提醒：\texttt{read\_bytes()} 会把\textbf{整个文件读进内存}，在数 TB / 数万亿 token 的规模上会直接爆内存。工业做法是把数据按 shard 存储成 parquet 一类列式文件，\textbf{按 partition 增量加载}，而不是一次性读入。
+\end{warningbox}
+
+\subsection{模型与交叉熵：位置、残差与损失}
+
+模型的整体结构在第一部分已经拆解过，这里讲者只做“串起来”的说明（图~\ref{fig:p2-arch}）。\texttt{GPT} 模块包含：
+
+\begin{itemize}
+\item \textbf{token embedding}：\texttt{vocab\_size}（本例 256）$\rightarrow$ \texttt{n\_embd}（本例 128）；
+\item \textbf{position embedding}：位置 $0\ldots T-1$ $\rightarrow$ \texttt{n\_embd}，与 token embedding 相加；
+\item \textbf{若干个 Transformer Block}：本例 2 个；
+\item \textbf{最终 LayerNorm} 与 \textbf{输出头}：\texttt{Linear(n\_embd, vocab\_size)}，输出 logits；
+\item 权重初始化：线性层与嵌入用均值 0、标准差 0.02 的正态分布，偏置置零（讲者提到这些超参可以自己调，看是否收敛更快）。
+\end{itemize}
+
+前向传播里有两个值得记住的实现选择：
+
+\begin{enumerate}
+\item \textbf{位置编码是“加到嵌入上”的}：\texttt{pos = arange(0, T)}，取位置嵌入后与 token 嵌入相加，再进 Block。Part 3 会把它换成 RoPE，届时位置信息改为在注意力内部作用在 Q、K 上。
+\item \textbf{Block 采用 pre-norm 残差}：先归一化、再进注意力和前馈，然后与原始输入相加。视频里展开的 Block 是 $x \leftarrow x + \mathrm{Attn}(\mathrm{LN}(x))$，$x \leftarrow x + \mathrm{FFN}(\mathrm{LN}(x))$；FFN 是「线性升维 4 倍 $\rightarrow$ GELU $\rightarrow$ 线性降回 $\rightarrow$ dropout」。
+\end{enumerate}
+
+当 \texttt{targets} 不为空时，模型直接计算交叉熵损失。把 logits 展平成 $(B\cdot T, \text{vocab})$、targets 展平成 $(B\cdot T)$，就是标准的下一 token 分类：
+
+$$\mathcal{L} = -\frac{1}{B\cdot T}\sum_{b=1}^{B}\sum_{t=1}^{T}\log\, p_\theta\big(y_{b,t}\ \big|\ x_{b,1},\dots,x_{b,t}\big)$$
+
+逐项解释：$B$ 是 batch size；$T$ 是上下文长度（\texttt{block\_size}）；$y_{b,t}$ 是第 $b$ 条样本第 $t$ 个位置的目标 token（也就是输入右移一位）；$p_\theta$ 是模型给该 token 的 softmax 概率。训练时“每个位置都在做一次 next-token prediction”，所以一条长度 128 的样本会贡献 128 个监督信号。
+
+\subsection{训练循环：AMP、梯度裁剪、验证与检查点}
+
+训练循环是 Part 2 的工程核心（图~\ref{fig:p2-amp}、图~\ref{fig:p2-trainstep}）。讲者按执行顺序拆开讲：
+
+\begin{enumerate}
+\item \textbf{设备与编译}：先用 \texttt{torch.cuda.is\_available()} 判断是否有 GPU，并且用户没有传 \texttt{--cpu}，才把设备设为 CUDA；若开启 \texttt{--compile}，用 \texttt{torch.compile} 把模型编译成更快的静态图。讲者顺势聊到 PyTorch/TensorFlow 的历史：PyTorch 早年以“动态图、好调试”取胜，TensorFlow 2.0 反过来引入动态执行，两家在趋同；选工具应看任务，不必站队。
+\item \textbf{优化器}：Adam，学习率、betas、weight decay 都从参数传入。
+\item \textbf{自动混合精度（AMP）}：用 \texttt{torch.amp.autocast} 把部分算子降到 FP16/BF16 计算，用 \texttt{GradScaler} 处理\textbf{梯度下溢}。
+\item \textbf{梯度裁剪}：\texttt{clip\_grad\_norm\_(params, grad\_clip)}，本例 \texttt{grad\_clip=1.0}，防止个别异常样本产生巨大梯度把模型带偏。
+\item \textbf{日志、验证与保存}：每 50 步打印 loss；每 \texttt{eval\_interval} 步在验证集上估损失；验证损失创新低就保存 checkpoint（模型 \texttt{state\_dict} + 结构超参，便于精确恢复）。
+\end{enumerate}
+
+混合精度的因果链值得完整复述一遍：FP16 的指数位少、能表示的最小正数有限；当梯度小于这个范围时会变成 0（\textbf{underflow}），对应的参数就“学不动”。GradScaler 的做法是\textbf{把 loss 乘以一个缩放因子} $S$ 再反向传播，链式法则会让梯度也放大 $S$ 倍，于是不会下溢；在 \texttt{optimizer.step()} 之前再\textbf{除以 $S$}（\texttt{scaler.unscale\_(opt)}），保证实际更新量不变。GradScaler 还会动态调整 $S$：连续若干步没有溢出就乘 2 增大，一旦溢出就减半（文档里 \texttt{init\_scale=65536.0, growth\_factor=2.0, backoff\_factor=0.5, growth\_interval=2000}）。
+
+注意 \texttt{unscale\_} 的位置很关键：\textbf{先 unscale、再梯度裁剪、最后 step}。如果先裁剪后 unscale，裁剪阈值作用在放大后的梯度上，等价于阈值被缩小了 $S$ 倍。
+
+\begin{lstlisting}[caption={带 AMP 与梯度裁剪的训练步（据视频 \texttt{train.py} 整理，节选核心顺序）。}]
+scaler = torch.amp.GradScaler(enabled=(args.amp and device.type == "cuda"))
+for step in range(1, args.steps + 1):
+    xb, yb = ds.get_batch("train", args.batch_size, device)
+    with torch.amp.autocast(device_type="cuda", enabled=(args.amp and device.type == "cuda")):
+        _, loss = model(xb, yb)
+    opt.zero_grad(set_to_none=True)
+    scaler.scale(loss).backward()
+    if args.grad_clip > 0:
+        scaler.unscale_(opt)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+    scaler.step(opt)
+    scaler.update()
+\end{lstlisting}
+
+\begin{sloppypar}
+验证部分对应 \texttt{estimate\_loss}：把模型切到 \texttt{eval()}，在 \texttt{no\_grad()} 下从 train/val 各取 \texttt{eval\_iters} 个批次，前向算 loss 并取平均，再切回 \texttt{train()}。这里一个容易忽略的点是：\textbf{验证只关心 loss，不关心生成}；生成质量由单独的采样环节观察。
+\end{sloppypar}
+
+\subsection{采样：温度、top-k、top-p 与自回归生成}
+
+训练结束后（或在训练中途），脚本会从当前 checkpoint 出发做一次生成（图~\ref{fig:p2-temp}、图~\ref{fig:p2-topk}）。生成函数 \texttt{generate} 的骨架是标准的自回归循环：
+
+\begin{lstlisting}[caption={自回归生成的核心（据视频 \texttt{utils.py} / \texttt{model.generate} 整理，简化版）。}]
+@torch.no_grad()
+def generate(model, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
+    model.eval()
+    for _ in range(max_new_tokens):
+        idx_cond = idx[:, -model.block_size:]          # 截断到上下文窗口
+        logits, _ = model(idx_cond)                    # (B, T, vocab)
+        logits = logits[:, -1, :] / max(temperature, 1e-6)  # 只取最后一个位置
+        logits = top_k_top_p_filtering(logits, top_k, top_p)
+        probs = torch.softmax(logits, dim=-1)
+        next_id = torch.multinomial(probs, num_samples=1)
+        idx = torch.cat([idx, next_id], dim=1)
+    return idx
+\end{lstlisting}
+
+为什么只取 \texttt{logits[:, -1, :]}？讲者专门用一段动画解释：模型输出与输入长度相同，但\textbf{整体右移了一位}——输入 4 个 token，输出 4 个位置的预测，其中最后一个位置才是“基于完整输入预测的下一个 token”。因此生成时每一步只需要最后那一个位置的 logits。
+
+\textbf{温度（temperature）} 作用在 softmax 之前：把 logits 除以温度 $T$。$T<1$ 时 logits 差异被放大、分布更尖锐（更保守、更确定）；$T>1$ 时差异被压缩、分布更平坦（更随机、更有创造性）。实现上用 \texttt{max(temperature, 1e-6)} 防止除零。
+
+讲者还讨论了 \texttt{temperature=0} 的实践：Google 的 Gemini API 文档写的是“温度 0 意味着总是选概率最高的 token，但\underline{仍可能有一点点变化}”——这说明工业级实现里“温度 0”并不严格等于贪心，因此视频里的代码用 \texttt{max(temperature, 1e-6)} 防止除零；而 Part 3 的现代实现则显式地在最低温时改用 \texttt{argmax}。
+
+\textbf{top-k} 与 \textbf{top-p} 都是在“截断候选集”后再采样：
+
+\begin{itemize}
+\item \textbf{top-k}：保留概率最高的 $k$ 个 token，其余置为 $-\infty$，softmax 后概率为 0、不会被采样到。实现用 \texttt{torch.topk} 取第 $k$ 大的值作为阈值，把小于阈值的 logits 置 $-\infty$。
+\item \textbf{top-p（nucleus sampling）}：按概率降序排序、做累积和，只保留“累积概率刚好达到 $p$”之前的那批 token，长尾全部丢弃。实现上要注意\textbf{至少保留一个 token}（把 mask 的第一个位置强制设为不丢弃），否则极端情况下可能一个都不剩。
+\end{itemize}
+
+两种过滤可以叠加；再叠加“排序后过滤、最后用 \texttt{torch.scatter} 写回原始顺序”的实现技巧，就是视频里 \texttt{top\_k\_top\_p\_filtering} 的全部内容。
+
+\subsection{实测：损失在降，但模型仍然“不会说话”}
+
+讲者最后完整跑了一遍 Part 2（图~\ref{fig:p2-demo}）。终端输出里的关键信息有三类：
+
+\begin{itemize}
+\item \textbf{训练损失持续下降}：第 50 步约 2.26，第 100 步约 1.49；之后继续降到 1.34 / 1.28 / 1.24 / 1.23 量级；
+\item \textbf{验证损失同步下降}：例如第 100 步 \texttt{train 1.4577 / val 1.4425}，第 200 步 \texttt{train 1.2923 / val 1.2769}，说明不是单纯过拟合训练集；
+\item \textbf{生成样本仍然是“乱码”}：输出的是看起来像数据集中语言（本例是印地语文本）的字符片段，但没有语义。讲者解释得很坦率：\textbf{2 层、128 维的模型不可能生成有意义的文本}，这条流水线的价值在于“每一步都对、损失确实在降”。
+\end{itemize}
+
+\begin{importantbox}{这一讲真正要带走的三件事}
+\begin{enumerate}
+\item \textbf{分词器决定 token 序列的形状}：字节分词器简单但序列长；工业上换 BPE。
+\item \textbf{label shift 是语言模型训练的全部“标签来源”}：一条文本自己监督自己，$y$ 就是 $x$ 右移一位。
+\item \textbf{AMP 的正确顺序是 scale $\rightarrow$ backward $\rightarrow$ unscale $\rightarrow$ clip $\rightarrow$ step $\rightarrow$ update}；顺序错了训练会以很难排查的方式变差。
+\end{enumerate}
+\end{importantbox}
+
+\subsection{本章小结}
+
+\begin{itemize}
+\item 训练流水线：\texttt{orchestrator} 传参 $\rightarrow$ \texttt{train.py} 串起分词器、数据集、模型与训练循环；本例是 2 层、2 头、128 维、上下文 128 的“玩具模型”。
+\item 字节级分词器以 UTF-8 字节为 token、词表 256；实现极简但序列会变长，工业场景应换 BPE。
+\item 数据集直接读字节、按 90/10 切分、随机取窗口；$y$ 由 $x$ 右移一位得到（label shift），这是 next-token prediction 的标签构造方式。
+\item 交叉熵把每个位置的下一 token 分类损失平均起来；一条长度 $T$ 的样本贡献 $T$ 个监督信号。
+\item 训练循环的关键工程点是 AMP 的缩放/反缩放顺序、梯度裁剪、周期性验证与保存最优 checkpoint；验证 loss 与训练 loss 同步下降说明训练是健康的。
+\item 采样由温度控制分布尖锐程度、top-k/top-p 截断候选集；生成时只取最后一个位置的 logits，再自回归拼接。2 层模型能学会字符级统计，但生成不了有意义的文本。
+\end{itemize}
+
+% ============================================================
+
+\section{Part 3 — 架构现代化}
+
+\subsection{本讲定位：把“2017 年的 Transformer”升级成现代架构}
+
+Part 3 不再训练模型，而是\textbf{逐个替换架构零件}，把 Part 1/2 里的经典 Transformer 升级成今天常见的现代 LLM 结构。讲者列出的改造清单是：
+
+\begin{itemize}
+\item \textbf{RMSNorm}：替换 LayerNorm；
+\item \textbf{SwiGLU}：替换 FFN 里的 ReLU/GELU；
+\item \textbf{KV Cache}：推理加速（不是架构改动，但决定了后面的设计）；
+\item \textbf{Grouped-Query Attention（GQA）}：在多头与多查询之间折中，压缩 KV Cache；
+\item \textbf{Sliding Window Attention + Attention Sink}：把稠密注意力换成带“注意力汇聚点”的滑动窗口；
+\item \textbf{RoPE（旋转位置编码）}：替换绝对位置嵌入，兼顾相对位置信息与 KV Cache 友好性。
+\end{itemize}
+
+最后的 \texttt{demo\_generate.py} 用随机权重直接跑生成，\textbf{对比有/无 KV Cache 的速度}，从而把“架构改动”和“推理效率”两条线合在一起验证。
+
+\subsection{RMSNorm：只除均方根，不减均值}
+
+LayerNorm 做的是“减均值、除标准差、再仿射变换”；RMSNorm 把前两步简化成“\textbf{只除均方根}”：
+
+$$\mathrm{RMS}(x) = \sqrt{\frac{1}{d}\sum_{i=1}^{d}x_i^2 + \epsilon},\qquad y = \frac{x}{\mathrm{RMS}(x)}\cdot g$$
+
+逐项解释：$x\in\mathbb{R}^d$ 是一个 token 的隐藏向量；$d$ 是隐藏维度；$\epsilon$ 是防止除零的极小量；$g\in\mathbb{R}^d$ 是可学习的缩放参数（逐维）。与 LayerNorm 相比，它\textbf{不减均值、不加偏置}。
+
+讲者给的理由是\textbf{效率}：RMSNorm 只有平方、求均值、开方、除法几次逐元素运算，GPU 上可以更好地融合（fuse）成一个 kernel；而 LayerNorm 还要额外算均值与偏置。代价是表达能力略降，但实践表明这个简化几乎不损效果——这是“用更少的运算换同样的效果”的典型架构优化。
+
+\subsection{SwiGLU：用门控 + SiLU 替换 FFN 激活}
+
+经典 FFN 是“升维 $\rightarrow$ 激活 $\rightarrow$ 降维”。SwiGLU 把它换成\textbf{三条线性层 + 门控}（图~\ref{fig:p3-swiglu}）：
+
+$$\mathrm{FFN}(x) = W_3\big(\ \mathrm{SiLU}(W_2 x)\ \odot\ W_1 x\ \big),\qquad \mathrm{SiLU}(z) = z\cdot\sigma(z)$$
+
+逐项解释：$W_1$ 是“值”分支（不做激活）；$W_2$ 是“门”分支，过 \textbf{SiLU}（也叫 Swish，即 $z\cdot\mathrm{sigmoid}(z)$）；$\odot$ 是逐元素相乘；$W_3$ 把结果投影回隐藏维度。视频里的 \texttt{SwiGLU} 类就是 \texttt{w1/w2/w3} 三个无偏置线性层加一个 \texttt{nn.SiLU()}。
+
+讲者顺带展示了 SiLU 的曲线形状（图~\ref{fig:p3-silu}）：在负半轴不是像 ReLU 那样直接归零，而是一个平滑衰减的 S 形，因此比 ReLU 更平滑、梯度更连续——这正是它被现代 LLM 广泛采用的原因之一。
+
+\begin{knowledgebox}{SwiGLU 的代价}
+门控结构让 FFN 从两条大矩阵变成三条矩阵（\texttt{w1}/\texttt{w2}/\texttt{w3}），参数量增加约 50\%。因此现代模型通常会把 FFN 的扩展倍数从 4 略微调小，以保持总参数量可比——读实现时不要只看“mult=4”。
+\end{knowledgebox}
+
+\subsection{KV Cache：用显存换计算}
+
+生成是自回归的：生成第 2 个 token 时，第 1 个 token 的 K、V 与生成第 1 个 token 时完全一样，但朴素实现会把整个前缀重新前向一遍，\textbf{重复计算}。KV Cache 的做法是\textbf{把每层已经算出的 K、V 存起来}，新 token 只计算自己的 K、V，再与缓存拼接（图~\ref{fig:p3-kvslide}）。
+
+KV Cache 的代价是显存。讲者用白板算了一笔账（图~\ref{fig:p3-kvmem}）：假设一张 FP16 的卡、30B 参数模型、48 层、隐藏维 7168、序列长度约 1024（口述为 1000）、batch size 128，K 和 V 各存一份：
+
+$$2\ (\text{K,V}) \times 2\ \text{bytes} \times 48 \times 7168 \times 1024 \times 128 \approx 1.68\times 10^{11}\ \text{bytes} \approx 168\ \text{GiB} \approx 170\ \text{GB}$$
+
+逐项解释：第一个 2 表示 K 与 V 各一份；2 bytes 是 FP16；48 是层数；7168 是每层每个 token 的隐藏维；1024 是序列长度；128 是 batch size。结果约 170 GB——\textbf{比很多模型的权重大得多}。
+
+\begin{warningbox}{KV Cache 只在推理时存在}
+训练时我们一次前向整条序列、不需要缓存（每个训练样本都是独立的一次并行计算）；KV Cache 是\textbf{自回归生成}的加速手段。也正因为它变成了推理侧的主要显存开销，后面才有 GQA、滑动窗口这些“压缩缓存”的架构设计。
+\end{warningbox}
+
+\subsection{Grouped-Query Attention：在“效果”和“缓存大小”之间折中}
+
+三种注意力（图~\ref{fig:p3-gqa}）：
+
+\begin{itemize}
+\item \textbf{MHA（多头注意力）}：每个 query 头都有自己独立的 K、V 头。效果最好，KV Cache 最大。
+\item \textbf{MQA（多查询注意力）}：\textbf{所有} query 头共享同一组 K、V。KV Cache 最小、效率最高，但准确率损失明显。
+\item \textbf{GQA（分组查询注意力）}：折中——把 query 头分成若干组，每组共享一组 K、V。组大小（group size）可调。
+\end{itemize}
+
+讲者指出：选对组大小可以\textbf{把 KV Cache 降低一个数量级}而效果损失很小，这正是现代模型普遍采用 GQA 的原因。实现上，查询头的数量仍是 \texttt{n\_head}，K/V 头数量变成 \texttt{num\_kv\_heads}，二者必须整除；前向时用 \texttt{repeat\_interleave} 把 K、V 复制到与 query 头相同的数量（图~\ref{fig:p3-repeat}）。
+
+\subsection{滑动窗口注意力与 Attention Sink}
+
+稠密注意力的复杂度是序列长度的平方。当上下文很长时，一个自然的想法是“只看最近的一段”——\textbf{滑动窗口注意力（sliding window attention）}。但如果只保留窗口，会出现一个新问题：窗口滑过之后，序列开头的信息彻底丢失，注意力概率被迫摊到窗口内所有 token 上，导致困惑度上升、灾难性遗忘。
+
+\textbf{Streaming LLM} 的解法是保留\textbf{前几个 token 作为“注意力汇聚点”（attention sink）}：窗口滑动时，把不想分配的注意力概率“丢”到序列开头那几个固定 token 上（图~\ref{fig:p3-window}）。讲者解释这个直觉时强调：汇聚点相当于一个“垃圾桶”，让注意力不必在窗口内平摊；同时窗口内的 token 仍然是最近的上下文。
+
+另一个直觉来自\textbf{感受野}：单层滑动窗口只看最近 $w$ 个 token，但多层堆叠后，第 2 层每个位置都“看过”第 1 层 $w$ 个位置的输出，等效感受野随层数增长。讲者用句子 “The cat sat on a mat” 演示：窗口为 3 时，第 1 层看到 1–3、第 2 层就能覆盖 5 个 token（图~\ref{fig:p3-receptive}）。所以“窗口小”不等于“上下文小”，关键是层数够多。
+
+把“汇聚点 + 滑动窗口”落到 KV Cache 上，就是\textbf{滚动缓冲区 KV Cache（rolling buffer KV cache）}：缓存只保留最前面的若干汇聚 token 与最近的窗口 token，中间的直接剔除；实现上就是“取前 \texttt{attention\_sink} 个 + 取后 \texttt{sliding\_window} 个，再拼接”。讲者说配合合适的超参，这可以把 KV Cache 再降一个数量级。
+
+\subsection{位置编码的进化：绝对 $\rightarrow$ 相对 $\rightarrow$ RoPE}
+
+Transformer 本身是\textbf{位置无关}的：自注意力对输入顺序不敏感，而“猫坐在垫子上”和“垫子上坐着猫”含义完全不同，所以必须注入位置信息。讲者按三段讲这条进化线：
+
+\begin{enumerate}
+\item \textbf{绝对位置嵌入}：给位置 $0,1,2,\dots$ 各学一个向量加到 token 嵌入上。问题是每个位置彼此独立，模型学不到“两个 token 相距多远”这种\textbf{相对}关系。
+\item \textbf{相对位置嵌入}：引入只依赖“距离”的偏置 $B_{-2},B_{-1},B_0,B_1,B_2$，距离为 1 的 token 对都用 $B_1$。它能表达相对距离，但\textbf{与 KV Cache 冲突}：新 token 进来时，之前所有缓存项的偏置都要改，无法“缓存后就不动”。
+\item \textbf{RoPE（旋转位置编码）}：把位置信息编码成\textbf{旋转}——第 $m$ 个位置的向量旋转 $m\theta$，任意两个向量的内积就只依赖它们的角度差（相对距离）。每个 token 的旋转只由自己的位置决定，\textbf{已经写进 KV Cache 的项不需要再改}。
+\end{enumerate}
+
+RoPE 的数学形式在 RoFormer 论文里写得很清楚（图~\ref{fig:p3-paper}）：把 $d$ 维空间分成 $d/2$ 个二维子空间，对每一对维度施加旋转矩阵，旋转角与位置 $m$ 成正比，频率为
+
+$$\theta_i = 10000^{-2(i-1)/d},\qquad i = 1,\dots,d/2$$
+
+逐项解释：$\theta_i$ 是第 $i$ 对维度的旋转频率；$10000$ 是基频（base），由论文设定；$d$ 是头维度；$m\theta_i$ 是位置 $m$ 在该对维度上的旋转角。因为 $R_{\Theta,m}^{\top}R_{\Theta,n}=R_{\Theta,n-m}$，所以 $q_m^{\top}k_n$ 只依赖 $n-m$——这就是“绝对形式的旋转、相对位置的效果”。
+
+实现上不需要真的构造 $d\times d$ 的稀疏旋转矩阵（太浪费），而是\textbf{成对取数}：把向量的偶数维与奇数维分成 $x_1,x_2$，对每一对做二维旋转
+
+$$\begin{pmatrix}x_1'\\x_2'\end{pmatrix}=\begin{pmatrix}\cos(m\theta) & -\sin(m\theta)\\ \sin(m\theta) & \cos(m\theta)\end{pmatrix}\begin{pmatrix}x_1\\x_2\end{pmatrix}$$
+
+cos/sin 只依赖位置与频率，可以\textbf{预先算好缓存}（称为 RoPE cache，注意与 KV Cache 区分）。讲者特别强调一个实现差异：经典 Transformer 在进入 Block \textbf{之前}把位置嵌入加到 token 嵌入上；而 RoPE 是在注意力内部、\textbf{分别作用在 Q 和 K 上}（V 不旋转）。
+
+\subsection{代码走读：现代 GPT 与带缓存生成}
+
+\begin{sloppypar}
+最后讲者带读现代实现（\texttt{model\_modern.py}、\texttt{block\_modern.py}、\texttt{attn\_modern.py}、\texttt{rope\_custom.py}、\texttt{kv\_cache.py}）。整体开关被做成配置项：\texttt{rms\_norm}、\texttt{swiglu}、\texttt{rope}、\texttt{sliding\_window}、\texttt{attention\_sink}、\texttt{num\_kv\_heads}。几个关键点：
+\end{sloppypar}
+
+\begin{itemize}
+\item \textbf{模型前向多了一个 \texttt{kv\_cache\_list} 与 \texttt{start\_pos}}：每一层对应一个缓存对象；第一次调用时缓存为 \texttt{None}，之后逐步累积。
+\item \textbf{注意力内部}：Q/K/V 分别投影（因为 GQA 下 K/V 的头数少于 Q，不能再像以前那样一次线性层切三份）；对 Q、K 应用 RoPE；把当前 K/V 与缓存 \texttt{cat} 拼接；若启用滑动窗口，则做“保留前 \texttt{sink} 个 + 后 \texttt{window} 个”的裁剪；最后用 \texttt{repeat\_interleave} 对齐头数。
+\item \textbf{生成时}：第一步把整个 prompt 喂进去（\texttt{start\_pos=0}），之后每一步只喂\textbf{最后一个 token}（\texttt{idx[:, -1:]}），\texttt{start\_pos} 取缓存长度，从而避免重复计算前缀。
+\end{itemize}
+
+实测对比很直观：用随机权重、生成 200 个 token，\textbf{有 KV Cache 约 0.07 s，无 KV Cache 约 0.13 s}——接近 2 倍差距；模型未训练，所以输出内容没有意义，这个 demo 只验证“机制正确 + 速度收益”。讲者还写了一系列单元测试（RoPE 形状与数值、GQA 头数、KV Cache 形状），作为“改架构时先保正确性”的实践。
+
+\begin{knowledgebox}{“改架构”的工程顺序}
+讲者的实际流程值得抄：\textbf{先写测试（形状、数值变化、确定性）$\rightarrow$ 再逐模块替换（RMSNorm/SwiGLU/RoPE/GQA/窗口）$\rightarrow$ 用随机权重跑生成验证不崩 $\rightarrow$ 最后才谈速度与效果}。架构改动最容易出错的地方是形状与索引，单元测试是最便宜的保险。
+\end{knowledgebox}
+
+\subsection{本章小结}
+
+\begin{itemize}
+\item RMSNorm 去掉均值与偏置、只除均方根，运算更少、更易融合；SwiGLU 用“值分支 $\times$ SiLU(门分支)”替换普通激活，代价是 FFN 参数变多。
+\item KV Cache 用显存换计算，是推理侧的主要显存开销；按 30B/48 层/7168 维/序列 1024/ batch 128/FP16 估算约 168 GiB（约 170 GB）。
+\item GQA 在 MHA 与 MQA 之间折中：多个 query 头共享一组 K/V，可把 KV Cache 降低一个数量级；实现依赖 \texttt{repeat\_interleave}。
+\item 滑动窗口注意力只保留近期 token，配合 attention sink（保留序列开头几个 token）避免概率平摊与灾难性遗忘；多层堆叠让等效感受野随层数增长，落成实现即 rolling buffer KV cache。
+\item 位置编码从绝对到相对再到 RoPE：RoPE 用与位置成正比的旋转让内积只依赖相对距离，同时保持“每个 token 只由自己位置决定”的可缓存性；实现上用成对旋转 + 预计算 cos/sin 缓存（RoPE cache），只作用于 Q、K。
+\item 现代实现把上述改动都做成配置开关，并用“有/无 KV Cache”的生成计时与单元测试保证正确性；2 倍左右的推理加速来自“不重复计算前缀”。
+\end{itemize}
+
+\begin{knowledgebox}{下一部分预告（视频自述）}
+Part 4 会把这些现代架构真正用于训练，并补齐 Part 2 跳过的工程项：从字节分词切换到 BPE、\textbf{梯度累积}、学习率计划与 warmup、检查点保存/恢复，以及 TensorBoard / Weights \& Biases 日志。也就是说，“训练 \& 现代化”两块拼起来，才构成一条完整的现代 LLM 训练流水线。
+\end{knowledgebox}

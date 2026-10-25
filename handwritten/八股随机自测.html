@@ -1,0 +1,156 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
+<title>八股随机自测</title><style>
+body{font-family:-apple-system,"Microsoft YaHei",sans-serif;max-width:960px;margin:0 auto;padding:24px;line-height:1.7;color:#222}
+h1{border-bottom:3px solid #1a73e8;padding-bottom:8px}
+h2{border-left:5px solid #1a73e8;padding-left:10px;margin-top:32px}
+h3{margin-top:22px;color:#444}
+pre{background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:12px;overflow-x:auto;font-size:13.5px}
+code{font-family:Consolas,"Courier New",monospace;background:#f0f2f5;padding:1px 5px;border-radius:3px}
+pre code{background:none;padding:0}
+table{border-collapse:collapse;margin:12px 0}th,td{border:1px solid #ccc;padding:6px 12px}th{background:#f0f4f8}
+blockquote{border-left:4px solid #1a73e8;margin:10px 0;padding:4px 14px;background:#f5f9ff;border-radius:4px}
+hr{border:none;border-top:1px solid #e1e4e8;margin:24px 0}
+</style>
+<!-- dsh-site-enhancer:css -->
+<link rel="stylesheet" href="assets/site.css">
+</head><body class="ds-has-topbar" data-site-root=".">
+<h1>八股随机自测（大模型算法岗 · 题目乱序版）</h1>
+<blockquote>
+<p>用法：<strong>先看题、自己默答，再看答案</strong>——题目故意打乱主题顺序（自测时不能靠上下文猜答案）。每题答案 2-4 行，深度版本在《模型算法手写详解》和两份面试复盘里。</p>
+</blockquote>
+<hr />
+<p><strong>Q1. 训练时显存由哪几部分组成？</strong>
+权重 + 梯度 + 优化器状态 + 激活。bf16 训练下：权重 2 字节/参数、梯度 2 字节/参数、Adam 状态最多 12 字节/参数（FP32 主权重 + 两动量各 4 字节），合计约 16 字节/参数。</p>
+<p><strong>Q2. 为什么 Transformer 需要位置编码？</strong>
+注意力机制本身对位置不敏感——「A 打 B」和「B 打 A」的注意力分数一样。位置编码把顺序信息注入输入或注意力计算，让模型知道词序。</p>
+<p><strong>Q3. 组相对策略优化（GRPO）和近端策略优化（PPO）的核心区别？</strong>
+GRPO 用「同题一组答案组内互比」构造优势（减均值除标准差），砍掉价值模型，省一半显存；PPO 用价值模型（critic）逐状态估计未来收益，能逐步归因。可验证任务选 GRPO，稀疏长程任务 PPO 理论更强。</p>
+<p><strong>Q4. 交叉熵损失和负对数似然是什么关系？</strong>
+同一回事。交叉熵 CE = −Σ y·log p，one-hot 真值下 = −log p_正确类 = 负对数似然。最小化交叉熵 = 最大化对数似然（最大似然估计）。</p>
+<p><strong>Q5. 什么是奖励黑客（reward hacking）？</strong>
+模型找到奖励函数的漏洞，用「不解决问题但拿高分」的捷径刷分。防御：硬信号当裁判（客观执行）、软信号低权重封顶、异常轨迹过滤、监控似然和熵。</p>
+<p><strong>Q6. LayerNorm 和 BatchNorm 的区别？为什么大模型用 LayerNorm？</strong>
+BatchNorm 按 batch 维度归一（受 batch 大小影响、依赖 batch 统计）；LayerNorm 按特征维度归一（每个样本独立）。Transformer 序列长度可变、batch 小，LayerNorm 统计稳定，适合 NLP。</p>
+<p><strong>Q7. KV cache 是什么？为什么需要？</strong>
+自回归生成时缓存历史的 K、V，下一个词只算新词的注意力，不重算历史——总计算量从 O(n³) 降到 O(n²)。代价是显存：2×层数×序列长×维度×字节。</p>
+<p><strong>Q8. 在线策略蒸馏（OPD）的损失函数是什么？</strong>
+逐词的后向 KL 散度 KL(学生 ∥ 老师)——学生分布追老师分布，等价于老师打分当优势的策略梯度。对应关系：SFT 的负对数似然 ≡ 最小化前向 KL(数据 ∥ 学生)（CE = H(数据) + KL，H 是常数）——覆盖式，老师写过的都要会，所以是「背答案」；OPD 用后向 KL——主模式式，学生写到哪老师批到哪。</p>
+<p><strong>Q9. 前向 KL 散度和后向 KL 散度？</strong>
+前向 KL(真实∥学生) = 覆盖式（真实分布高的地方学生必须高，宁滥勿缺）；后向 KL(学生∥老师) = 主模式式（学生敢在老师不看好的地方说话惩罚爆炸，宁缺勿滥）。蒸馏选后向。</p>
+<p><strong>Q10. 什么是死亡螺旋（似然崩塌）？怎么治？</strong>
+奖励在涨、模型对自己输出的似然在持续下降——模型钻进奖励漏洞的捷径模式。三步机制：漏洞捷径 → 熵崩 → 似然崩。治法：懒似然位移（只罚似然下降方向的单向铰链惩罚，强度随下降幅度比例缩放）。</p>
+<p><strong>Q11. 混合精度训练为什么快？会不会掉精度？</strong>
+权重和激活用 fp16/bf16 存算（半精度吞吐高、显存省一半），梯度用 fp16、优化器主权重用 fp32。加损失缩放（loss scaling）防 fp16 梯度下溢。bf16 指数位和 fp32 一样宽，不会溢出，只是尾数精度低一点。</p>
+<p><strong>Q12. 什么是梯度累积？为什么用它？</strong>
+显存装不下大 batch 时，把大 batch 拆成若干小 batch 分别前向反向、梯度累加不更新，累积 N 次后再更新一次。等效于大 batch 训练，代价是训练变慢（中间不更新）。</p>
+<p><strong>Q13. ZeRO 三层分别分片什么？</strong>
+ZeRO-1 分片优化器状态；ZeRO-2 加分片梯度；ZeRO-3 连权重一起分片。显存占用逐层递减，通信量逐层递增。FSDP 相当于 ZeRO-3。</p>
+<p><strong>Q14. FSDP 一次训练步里哪些阶段要通信？</strong>
+前向：每层前 all-gather 该层权重（拼出完整权重，算完释放）；反向：每层再 all-gather 权重、梯度算完做 reduce-scatter（按分片归约到各卡）；优化器更新各卡本地做，不需要通信。</p>
+<p><strong>Q15. ring all-reduce 为什么好？</strong>
+N 张卡成环，梯度切 N 份传 N−1 轮，每卡总收发 2(N−1)/N 份数据 ≈ 2 份，通信量不随卡数增长；没有中心节点的带宽瓶颈，带宽用满每张卡的链路。</p>
+<p><strong>Q16. 分布式训练里 checkpoint 怎么保存？</strong>
+每张卡保存自己的参数分片 + 元数据（分片清单、形状），不做全量聚合（聚合到一张卡会爆显存）；推理/发布时外部脚本按元数据合并。</p>
+<p><strong>Q17. 什么是 LoRA？为什么有效？</strong>
+冻结原权重 W，只训练两个小矩阵 B、A：W' = W + (α/r)·BA。微调对权重的改动是低秩的，少数方向就够表达；可训练参数只有千分之一量级。QLoRA 再加 4 比特量化存基座、双重量化、分页优化器。</p>
+<p><strong>Q18. RoPE 的核心性质？</strong>
+把 q、k 按维度两两分组乘旋转矩阵，旋转角 = 位置 × θ。关键性质：两个位置的旋转点积只依赖相对位置 n−m——天然是相对位置编码。维度越低频率越高；长文本外推靠调大 base（NTK 缩放）。</p>
+<p><strong>Q19. 注意力复杂度是多少？怎么优化？</strong>
+标准注意力 O(n²·d)（分数矩阵 n×n）。优化：FlashAttention（分块 + 在线 softmax，显存 O(n²)→O(n)）、稀疏/窗口注意力、线性注意力近似。</p>
+<p><strong>Q20. FlashAttention 为什么快？结果和标准注意力一样吗？</strong>
+瓶颈在显存带宽（n×n 矩阵读写 HBM）。分块 + 在线 softmax 让矩阵不落地，显存 O(n)。结果精确相等——不是近似，只是换了计算顺序。</p>
+<p><strong>Q21. masked_fill 为什么填 -1e9 而不是 -inf？</strong>
+softmax 里 e^(−1e9) 下溢成 0，效果与 −inf 相同；但 −inf 在部分运算里会出 NaN。causal mask 用上三角置 0 再 masked_fill。</p>
+<p><strong>Q22. 多头注意力的形状怎么走？</strong>
+x (b, s, d) → 投影 (b, s, d) → view (b, s, h, d_k) → transpose (b, h, s, d_k) → score = q@kᵀ/√d_k (b, h, s, s) → softmax → @v (b, h, s, d_k) → transpose + view 拼接回 (b, s, d) → Wo 投影。</p>
+<p><strong>Q23. 为什么注意力分数要除以 √d_k？</strong>
+Q、K 元素是零均值独立随机变量，点积方差 = d_k。不除则分数过大，softmax 进入饱和区、梯度消失；除以 √d_k 把方差归一为 1。</p>
+<p><strong>Q24. softmax 为什么减 max？</strong>
+数值稳定：z 很大时 e^z 溢出；减 max 后分子分母同除 e^max，结果不变且不溢出。</p>
+<p><strong>Q25. 什么是 state masking？你的搜索项目怎么用的？</strong>
+多轮交互中把「系统注入的状态」部分从损失里屏蔽。搜索项目里 <code>&lt;information&gt;</code> 搜索结果的 token 不参与 loss——否则模型学会抄搜索结果而非推理，且长结果稀释训练信号。</p>
+<p><strong>Q26. SFT、DPO 的损失函数各是什么？</strong>
+SFT = 负对数似然 −log π(y|x)（无奖励概念）。DPO = 隐式奖励 r = β·log(πθ/πref)，损失 = −log σ(β·[log πθ(y好) − log πθ(y差)] − β·[log πref(y好) − log πref(y差)])——让好答案相对差答案的概率比超过参考模型。DPO 用偏好对，SFT 用正样本。</p>
+<p><strong>Q27. RLHF 的完整流程？</strong>
+监督微调（SFT 学格式和基本能力）→ 训练奖励模型（人类偏好对比数据）→ 强化学习（PPO/GRPO 用奖励模型打分优化策略）。现在流行的简化：DPO 直接跳过奖励模型，用偏好对训练。</p>
+<p><strong>Q28. 什么是舒适区陷阱（你代码项目踩过的）？</strong>
+手写过程奖励按「部分测试通过比例」给中间分，模型学会停在「部分正确」拿分、不冲全对。教训：行为级奖励可以手写，正确性级奖励必须数据驱动。</p>
+<p><strong>Q29. 什么是稀疏奖励？怎么处理？</strong>
+只有最终结果给分、中间没有信号的奖励（搜索任务答对才 1 分）。处理：行为级过程奖励搭梯子、稠密信号（蒸馏）、课程学习。风险：过程奖励与对错解耦会被钻空子。</p>
+<p><strong>Q30. 采样温度、top-k、top-p 分别控制什么？</strong>
+温度 T：softmax 前除 T，T 越大分布越平（越随机）；top-k：只从概率最高的 k 个词里采样；top-p：从累计概率达到 p 的最小集合里采样。三者可叠加，控制多样性与质量的权衡。</p>
+<p><strong>Q31. 贪心解码和 beam search 的区别？</strong>
+贪心每步取概率最大的词（快，可能陷入局部最优）；beam search 每步保留 top-k 条路径（更全局，k 越大越慢）。pass@1 评测用贪心/单次采样。</p>
+<p><strong>Q32. 什么是量化？常见的量化方法？</strong>
+把权重/激活从 fp16/32 压到低比特（8bit/4bit）。训练后量化：GPTQ（逐层最小化量化误差）、AWQ（按激活重要度缩放权重）；量化感知训练：训练时模拟量化。风险：精度损失，4 比特以下明显。</p>
+<p><strong>Q33. PagedAttention 解决什么问题？</strong>
+KV cache 按固定页管理（类似操作系统分页），解决显存碎片化和预留浪费——vLLM 吞吐大幅提升的来源。你 vLLM 项目里「请求准入预留整条序列显存」预留的就是 KV。</p>
+<p><strong>Q34. continuous batching 是什么？</strong>
+动态批处理：请求完成后立即从批里移除、新请求立即加入（不必等整批完成），推理引擎利用率大幅提升——对比静态 batching 等整批完成。</p>
+<p><strong>Q35. 什么是投机采样（speculative decoding）？</strong>
+小模型（草稿模型）快速生成 K 个候选词，大模型一次验证全部接受/拒绝——大部分词一次验证通过，端到端加速 2-3 倍，输出分布不变。</p>
+<p><strong>Q36. RAG 的完整流程？</strong>
+离线：文档切块（chunking）→ 向量化（embedding）→ 建索引（向量库）；在线：query 向量化 → 召回 top-k → 重排（rerank）→ 拼进提示词给 LLM 生成。要点：切块粒度、召回与精排两阶段、引用与幻觉权衡。</p>
+<p><strong>Q37. 什么是幻觉？怎么缓解？</strong>
+模型生成与事实不符但看似合理的内容。缓解：RAG（外部证据约束）、让模型先检索再回答、训练数据去噪、鼓励模型说「不知道」、引用溯源。</p>
+<p><strong>Q38. Agent 的 tool use / function calling 是怎么工作的？</strong>
+模型按 schema 输出结构化的工具调用（函数名+参数 JSON），系统解析并执行工具，结果拼回上下文继续生成。训练上：SFT 学格式、强化学习学「什么时候该调用」——你搜索项目的核心就是后者。</p>
+<p><strong>Q39. 什么是异常轨迹过滤？过滤哪些？</strong>
+训练前检测并剔除会污染组内统计量的轨迹：格式对但没搜索（假装作答）、搜索失控被上限掐断、格式解析失败。只剔除组内有问题的轨迹、同组重算优势；正常负样本不过滤。</p>
+<p><strong>Q40. 什么是数据蒸馏（离线蒸馏）？</strong>
+用大模型生成高质量轨迹作为小模型 SFT 的训练数据——学生学老师的分布。优点：便宜、格式好；局限：天花板是老师的能力，学不会老师没示范过的能力。</p>
+<p><strong>Q41. 自蒸馏为什么没新知识？</strong>
+老师就是之前蒸馏出数据的同一个模型，学生已经把老师会的东西学完了——再蒸一轮没有增量（你 E9p3 的结论之一）。</p>
+<p><strong>Q42. 训练长度拐点是什么？你项目里的证据？</strong>
+训练轮数存在峰值：过训会灾难退化。你的证据：E1 组相对策略优化四轮 19.8（过训），E7/E9p2 两轮 25.2（峰值）——两轮是最优长度。</p>
+<p><strong>Q43. 什么是难度依赖（信号选型）？</strong>
+不同训练信号适合不同难度：简单题执行奖励够用（多数答案能跑通）；竞赛题执行奖励全是零没梯度，老师的稠密蒸馏信号最好用。信号选择是题目难度的函数——你代码项目的核心结论（+4.9）。</p>
+<p><strong>Q44. 概率校准是什么？你项目里怎么做的？</strong>
+把模型输出的原始分数映射成真实概率。Platt 校准：sigmoid(a·分数 + b)，两个参数在验证集上拟合。你的 verifier 用 k/N 回归 + Platt 校准，校准误差 0.0067。</p>
+<p><strong>Q45. verifier 奖励模型的作用？</strong>
+把「沙箱执行」的硬判决变成「不执行也能拿到」的连续预测通过率。你的用法：门控蒸馏的门控器（评委定方向、老师定幅度）；低权重（×0.1）当软信号，主裁判永远是沙箱。</p>
+<p><strong>Q46. 组内优势 A = (r − mean)/std 的 mean 和 std 是哪来的？</strong>
+同一道题的组内（比如 4 或 8 个答案）的奖励均值和标准差——组内互比自带基线，题难易自动抵消，不需要价值模型。</p>
+<p><strong>Q47. 熵崩是什么？为什么危险？</strong>
+输出分布变尖、多样性死亡——模型只会说一种话。危险：探索消失、组内标准差趋零、优势失效，训练锁定在捷径上。</p>
+<p><strong>Q48. GSPO 是什么？</strong>
+组序列策略优化——Qwen 团队针对 MoE 模型 GRPO 崩溃的改良：把 token 级重要性比改成序列级聚合，降低 token 级噪声导致的崩溃。</p>
+<p><strong>Q49. 什么是 pass@1 和 pass@k？</strong>
+pass@1：每题只生成一次、判对错、算通过率（最严格）；pass@k：每题生成 k 次、任意一次通过算过（更宽松）。你的评测全部用 pass@1。</p>
+<p><strong>Q50. 评测防数据泄漏怎么做？</strong>
+用「活」基准（持续收集新题的 LiveCodeBench）、冻结版本保证可比性、加强测试版（EvalPlus 把测试用例扩 80 倍防背答案过拟合）、同一套脚本同一次采样保证口径一致。</p>
+<p><strong>Q51. 学习率 warmup 为什么？</strong>
+训练初期梯度估计噪声大、Adam 二阶矩还没积累，直接大步长会跑飞；warmup 用前几百步把学习率从 0 线性升到目标值，稳定训练初期。</p>
+<p><strong>Q52. 梯度裁剪（gradient clipping）解决什么？</strong>
+防止梯度爆炸：按范数缩放梯度（超过阈值就整体缩放）。RNN 时代必备，现在大模型训练也普遍开。</p>
+<hr />
+<h2 id="sec-1">自测记分卡</h2>
+<table>
+<thead>
+<tr>
+<th>轮次</th>
+<th>答对</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第 1 轮</td>
+<td>/52</td>
+<td></td>
+</tr>
+<tr>
+<td>第 2 轮</td>
+<td>/52</td>
+<td>只重测错的</td>
+</tr>
+<tr>
+<td>考前</td>
+<td>/52</td>
+<td>全过即可上考场</td>
+</tr>
+</tbody>
+</table>
+<!-- dsh-site-enhancer:js -->
+<script src="assets/site.js"></script>
+</body></html>

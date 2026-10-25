@@ -1,0 +1,303 @@
+\section{Part 8 — 基于 PPO 的 RLHF}
+
+这是整门课的最后一程：Part 6 我们用指令数据做了 SFT（监督微调），Part 7 用人类偏好数据训练了奖励模型（reward model, RM），Part 8 要把这两样东西接起来——把奖励模型当作环境给出的奖励，用 PPO（Proximal Policy Optimization）去优化语言模型，让它生成人类更喜欢的回答。这个阶段就是通常所说的 RLHF（Reinforcement Learning from Human Feedback）。
+
+这一讲是纯代码实现：讲师在 \texttt{train\_ppo.py}、\texttt{rollout.py}、\texttt{ppo\_loss.py}、\texttt{eval\_ppo.py} 里从零搭出一套最小但完整的 PPO-RLHF 训练循环，包括三个模型的加载与冻结、rollout 采样、上下文截断与 mask、token 级 log 概率、KL 奖励塑形、优势标准化、PPO 裁剪损失、训练日志与评测。读懂这套代码，你就拥有了理解所有现代 RLHF 实现（TRL、OpenRLHF 等）的骨架。
+
+\subsection{RLHF 三阶段与 PPO 的位置}
+
+先回看整个训练管线（图~\ref{fig:p8-pipeline}）：预训练（pretraining）得到基座模型；SFT 用「指令—回答」示范数据做监督微调，得到参考模型 $\pi_{\text{SFT}}$；奖励建模用人类偏好对训练一个打分模型 $r_\phi$；最后 RLHF 用 $r_\phi$ 作为奖励，用 PPO 更新策略。
+
+前两个阶段在本课程中已经完成。奖励建模用的是 Bradley--Terry 模型，损失为
+
+$$
+\mathcal{L}_{\text{RM}}(\phi)
+= -\,\mathbb{E}_{(x,\,y_w,\,y_l)}
+\Big[\log \sigma\big(r_\phi(x, y_w) - r_\phi(x, y_l)\big)\Big],
+$$
+
+其中 $x$ 是 prompt，$y_w$ 是人类更喜欢的回答（chosen），$y_l$ 是更差的回答（rejected），$r_\phi(x,y)$ 是奖励模型对「prompt 与回答」给出的标量分，$\sigma$ 是 sigmoid。它要求好回答的分数高于坏回答。
+
+现在进入 RLHF。它的优化目标不是「模仿某个回答」，而是「最大化奖励模型的期望打分，同时不要离参考模型太远」：
+
+\begin{importantbox}{RLHF 的优化目标}
+$$
+\max_{\theta}\ \mathbb{E}_{x \sim \mathcal{D},\ y \sim \pi_\theta(\cdot \mid x)}
+\Big[\, r_\phi(x, y) \;-\; \beta\, \mathrm{KL}\big(\pi_\theta(\cdot \mid x) \,\|\, \pi_{\text{ref}}(\cdot \mid x)\big) \Big],
+$$
+其中 $\theta$ 是策略参数，$\pi_\theta(\cdot\mid x)$ 是当前策略（正在训练的 LLM），$\mathcal{D}$ 是 prompt 分布，$r_\phi$ 是冻结的奖励模型，$\pi_{\text{ref}}$ 是冻结的参考模型（就是 SFT 模型），$\beta$ 是 KL 惩罚系数。
+\end{importantbox}
+
+为什么要加 KL？讲师在课上讲得很直白：RL 阶段的目标是迎合人类偏好，模型完全可能为了更高的奖励分而「跑偏」——输出风格变差、语言能力退化，甚至学会钻奖励模型的空子；更严重的是\textbf{灾难性遗忘}（catastrophic forgetting），即把 SFT 阶段学到的能力丢掉。KL 项的作用有两个：一是\textbf{度量}当前策略偏离 SFT 有多远，二是用这个偏离量去\textbf{惩罚}奖励，从而把更新限制在稳定范围内（这也就是 PPO 中「proximal」的含义之一）。
+
+\subsection{把语言生成写成强化学习问题}
+
+开始写代码之前，必须先把「LLM 逐 token 生成」翻译成 RL 语言。课上给出的这张术语表（图~\ref{fig:p8-terms}）是整讲的地基：
+
+\begin{center}
+\begin{tabular}{p{3.0cm}p{11.0cm}}
+\toprule
+RL 概念 & 在本课程的 LLM 中对应什么 \\
+\midrule
+State $s_t$ & 当前文本上下文：prompt 加上到目前为止已生成的 token \\
+Action $a_t$ & 下一个 token。本课程 toy 模型的词表大小为 8000，所以每一步是 8000 选 1 \\
+State--action $(s_t,a_t)$ & 某个具体上下文，以及在这个上下文里选择的具体下一个 token \\
+Policy $\pi_\theta$ & LLM 给出的 next-token 概率分布，也是本阶段要更新的对象 \\
+Value $V(s_t)$ & 在上下文 $s_t$ 下继续按当前策略生成，预期能拿到的总奖励预测 \\
+Reward $r_t$ & 标量分。RLHF 中通常只在回答结束时给一次：奖励模型的打分（本讲还在每个 token 上叠加 KL 惩罚） \\
+Returns $G_t$ & 从第 $t$ 步开始未来奖励的（折扣）和；它和 value 的差就是 value loss 的来源 \\
+Q-value $Q(s_t,a_t)$ & 在 $s_t$ 下先选 token $a_t$、之后按策略继续的期望回报 \\
+Advantage & $A=Q-V$：选这个 token 比「该上下文的平均水平」好多少 \\
+KL divergence & 当前策略与冻结参考模型在同一上下文下分布的距离，用来衡量偏离 SFT 的程度 \\
+Policy vs Ref & Policy 是不断更新的 RL 模型；Ref 是冻结的 SFT 模型，只用于 KL 约束 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+有几个数字要记住：本课程模型的词表大小是 8000；上下文窗口 \texttt{block\_size} 是 256；所以一次前向的 logits 形状是「batch × 序列长度 × 8000」。这与普通语言模型训练看起来一样，区别在于：训练信号不再来自「下一个 token 的标签」，而来自奖励模型对整条回答的打分。
+
+\begin{knowledgebox}{语言模型 RL 与经典 RL 的四个不同}
+(1) \textbf{动作空间巨大}：每一步要在整个词表（本讲 8000 个 token）上做 softmax；(2) \textbf{环境是确定性的}：给定上下文，下一个 token 由策略采样，没有外部模拟器；(3) \textbf{奖励稀疏、只在结尾}：生成完才由奖励模型打分，中间没有外部奖励，因此 credit assignment 要靠 value/returns 来做；(4) \textbf{回合长度可变}：每条回答的 token 数不同，所有损失与统计都必须用 mask 只统计「模型自己生成的 token」，不能把 prompt 与 padding 算进去。
+\end{knowledgebox}
+
+\subsection{训练器结构：三份权重与超参数}
+
+训练脚本是 \texttt{train\_ppo.py}，入口 \texttt{main()} 先把超参数用 \texttt{argparse} 暴露出来（图~\ref{fig:p8-hparams}）。这些默认值就是本讲实验的配置：训练步数 100、batch 大小 4、上下文窗口 256、回答长度 64、KL 系数 0.01、折扣因子 $\gamma=1.0$、GAE 的 $\lambda=0.95$、学习率 $1\times10^{-5}$。
+
+\begin{center}
+\begin{tabular}{p{3.4cm}p{2.6cm}p{8.0cm}}
+\toprule
+参数 & 取值 & 作用 \\
+\midrule
+\texttt{steps} & 100（演示 50） & 训练循环的步数 \\
+\texttt{batch\_size} & 4 & 每步采样的 prompt 数（记为 $P$），也是 PPO 的 batch \\
+\texttt{block\_size} & 256 & 上下文窗口上限（prompt + 回答的总长度） \\
+\texttt{resp\_len} & 64（演示 128） & 每条回答最多生成的 token 数 \\
+\texttt{kl\_coef} & 0.01 & KL 惩罚系数 $\beta$ \\
+\texttt{gamma} & 1.0 & 折扣因子；只在结尾给奖励时取 1 最简单 \\
+\texttt{lam} & 0.95 & GAE 的 $\lambda$（参数保留；本讲示例实现做了简化，见「奖励塑形、KL 控制与优势估计」一节） \\
+\texttt{lr} & $1\times10^{-5}$ & AdamW 学习率（RLHF 通常远小于 SFT） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+接着加载模型。PPO-RLHF 需要三份权重（图~\ref{fig:p8-models}）：
+
+\begin{enumerate}
+\item \textbf{Policy}：\texttt{PolicyWithValue}，由语言模型主干加一个线性 value head 组成。它从 Part 6 的 SFT 检查点初始化，是唯一需要训练的部分（主干 + value head）；
+\item \textbf{Reference}：同样架构的 \texttt{PolicyWithValue}，复制 SFT 权重后设置 \texttt{requires\_grad\_(False)} 并切到 \texttt{eval()}，全程冻结，只为计算 KL；
+\item \textbf{Reward model}：从 Part 7 的检查点加载，输入是格式化后的「prompt + 回答」，输出一个标量奖励；同样冻结、只做前向。Part 7 的奖励模型是 encoder-only 结构（双向注意力 + masked mean pooling + 标量头），参数量比语言模型小很多，所以多一份前向的代价可以接受。
+\end{enumerate}
+
+对应的初始化代码大致如下（据课堂代码整理）：
+
+\begin{lstlisting}[caption={加载三份权重：policy（可训练）、ref（冻结）、reward model（冻结）},label={lst:p8-models}]
+policy = PolicyWithValue(vocab_size, block_size, n_layer, n_head, n_embd).to(device)
+policy.lm.load_state_dict(ckpt["model"])       # 用 SFT 权重初始化语言模型
+
+ref = PolicyWithValue(vocab_size, block_size, n_layer, n_head, n_embd).to(device)
+ref.lm.load_state_dict(ckpt["model"])
+for p_ in ref.parameters():
+    p_.requires_grad_(False)                   # 参考模型全程冻结
+ref.eval()
+
+rm = RewardModel(vocab_size=..., block_size=...).to(device)
+rm.load_state_dict(rcpt)
+rm.eval()                                      # 奖励模型只做前向
+\end{lstlisting}
+
+为什么 value head 要和 policy 共享主干？因为 critic 需要和 actor 一样理解语言；共享主干只多一个线性头，省下一整份大模型的显存与前向开销。代价是 policy 与 value 的梯度会互相影响，工程上通常用一个较小的 \texttt{vf\_coef}（本讲 0.5）来平衡。
+
+\subsection{Rollout：采样、奖励与 token 级数据}
+
+训练循环的第一步是 rollout：用当前策略采样回答。图~\ref{fig:p8-rollout} 是采样代码：从 Alpaca 数据集（与 SFT 相同的数据源）取 prompt，按 SFT 的对话格式拼好、去掉末尾的 \texttt{</s>}（因为后面要自己生成回答），然后逐个 prompt 调用 \texttt{policy.generate}，最后把 prompt + 回答的完整 token 序列存起来。注意生成参数：\texttt{temperature=0.2}、\texttt{top\_k=3}，即采样但仍偏保守；\texttt{max\_new\_tokens} 由 \texttt{resp\_len} 控制。
+
+拿到生成结果后，要对每条样本做三件事（图~\ref{fig:p8-reward}）：
+
+\begin{enumerate}
+\item \textbf{切分 prompt 与回答}：prompt 的 token 数就是边界，记作 \texttt{boundary}；从边界一直切到序列末尾，就是模型生成的全部回答 token。
+\item \textbf{用奖励模型打分}：把回答解码成文本，再用 SFT 的格式化函数重新拼成「instruction + response」格式，喂给奖励模型，得到标量奖励 $r$；
+\item \textbf{记录轨迹}：把（完整 token 序列，boundary，奖励）存进 \texttt{data} 列表，供后续构造 batch。
+\end{enumerate}
+
+这里有一个关键细节：RLHF 的奖励是「整条回答一个分」，但 PPO 的损失是 token 级的。因此实现上要把这个分数放到回答的\textbf{最后一个生成 token} 上，其余 token 的奖励为 0（KL 惩罚除外，见「奖励塑形、KL 控制与优势估计」一节）。另外，回答长度不一，必须把一批样本 pad 到同一长度，并记录哪些位置是「模型生成」、哪些是「prompt」、哪些是「padding」——这就是动作掩码（action mask）的由来。
+
+\paragraph{上下文截断：宁可裁 prompt，绝不裁回答。}课程的上下文窗口只有 256，而 prompt 可能很长。讲师用一张手绘图（图~\ref{fig:p8-crop-wb}）说明了规则：如果 prompt 250 个 token、回答 10 个 token，一共 260 超过 256，那么从 260 里裁掉多出的部分——\textbf{只从 prompt 的左侧裁}，回答的 10 个 token 必须完整保留，于是变成「246 + 10」。
+
+图~\ref{fig:p8-crop-code} 是对应的代码：先算这一批里最长的样本，并与 \texttt{block\_size} 取最小值得到 \texttt{max\_len}；对每条样本，\texttt{drop = L\_full - L} 是要裁掉的数量，\texttt{b = max(0, boundary - drop)} 是裁剪后回答起点的位置；\texttt{seq[i, :L] = ids[-L:]} 只保留末尾 \texttt{L} 个 token（即从左边裁），不足部分用 \texttt{<pad>}（代码里是 token id 2）填充；\texttt{mask[i, b:L] = True} 标出回答 token；\texttt{rewards[i, L-1] = r\_scalar} 把奖励放在回答最后一个位置上。
+
+\begin{warningbox}{截断与 mask 的三个易错点}
+(1) 截断只能发生在 prompt 侧；如果连回答 token 一起裁掉，奖励就挂在了一个不完整的回答上，训练信号会错位。(2) pad 之后 mask 必须精确覆盖「回答」区间，prompt 和 padding 都不能算进 loss 或 value loss。(3) 奖励要放在回答的最后一个 token 上（\texttt{L-1}），而不是序列末尾的 padding 上——后者会让奖励位置错位一格。
+\end{warningbox}
+
+\subsection{从 token 到 log 概率：shift 标签与 gather}
+
+PPO 需要每个生成 token 的对数概率 $\log \pi_\theta(a_t\mid s_t)$。这一步和语言模型训练很像，但方向相反：训练时我们是「输入 token、预测下一个 token」，所以标签要右移一位——图~\ref{fig:p8-shift} 画的就是 \texttt{logits} 对应 $t_1,t_2,t_3,t_4$，而 \texttt{labels} 是 $t_2,t_3,t_4$。也就是说，位置 $t$ 的 logits 用来预测位置 $t+1$ 的 token。
+
+具体做法是：先对 logits 做 \texttt{log\_softmax}，再用 \texttt{gather} 按标签索引取出对应 token 的 log 概率：
+
+$$
+\log \pi_\theta(a_t \mid s_t) = \mathrm{log\_softmax}(\mathrm{logits}_t)\big[\,a_t\,\big],
+$$
+
+其中 $\mathrm{logits}_t \in \mathbb{R}^{8000}$ 是第 $t$ 个位置对词表所有 token 的打分，$\mathrm{log\_softmax}(\cdot)$ 把打分变成对数概率，$a_t$ 是实际生成的 token id，方括号表示按索引取值。以课上调试的数值为例：某个位置的标签是 203，对应位置的 log 概率是 $-48.3569$；另一个位置标签是 297，取出 $-25.1141$——这与手动从 8000 个对数概率里取第 203/297 个完全一致。
+
+注意两个形状细节：序列长度是 159 时，右移后的标签只有 158 个位置，所以 log 概率也是 158；value 也是每个位置一个标量，同样要去掉最后一个位置变成 158。最后再把动作掩码作用上去，只保留回答 token：示例 batch 的回答 token 总数是 325（四个样本分别是 67、19、111、128 个回答 token）。此后所有的 policy loss、value loss、KL、奖励都在这个「长度 325 的扁平向量」上计算。
+
+\begin{importantbox}{动作掩码（action mask）是 token 级 RLHF 的核心工程}
+语言模型生成里混杂了三类 token：prompt（用户给的）、回答（模型生成的）、padding（补齐的）。只有\textbf{回答 token} 是「策略的动作」，才有 policy loss、value、KL 与奖励。掩码一旦错位（例如长度 159 与 158 没对齐），损失会静默地算到错误位置，训练照样跑但学不到东西——这是 RLHF 实现里最常见、也最难 debug 的一类 bug。
+\end{importantbox}
+
+\subsection{奖励塑形、KL 控制与优势估计}
+
+现在每个回答 token 都有奖励模型给的（放在结尾的）分数，接下来要把它变成逐 token 的训练信号。第一步是计算 KL：用「当前策略 log 概率 - 参考模型 log 概率」作为单样本估计：
+
+$$
+\widehat{\mathrm{KL}}_t
+= \log \pi_{\text{old}}(a_t \mid s_t) - \log \pi_{\text{ref}}(a_t \mid s_t),
+$$
+
+其中 $\pi_{\text{old}}$ 是 rollout 时（即更新前）的策略，$\pi_{\text{ref}}$ 是冻结的 SFT 参考模型，$a_t$ 是采样到的 token。这个估计就是「对数概率之差」，无偏但方差较大、也可能为负；它的好处是只需要两个前向，代价极小。实现上先算 \texttt{kl = (old\_logp - ref\_logp)}，再把它作为惩罚从奖励里减掉：
+
+$$
+\tilde r_t = r_t - \beta\,\widehat{\mathrm{KL}}_t,
+\qquad
+r_t =
+\begin{cases}
+0, & t < T,\\[2pt]
+r_\phi(x, y), & t = T,
+\end{cases}
+$$
+
+其中 $\tilde r_t$ 是塑形后的逐 token 奖励，$r_t$ 是原始奖励（只有最后一个生成 token $T$ 才有奖励模型分数），$\beta$ 是 KL 系数（代码里的 \texttt{kl\_coef}，默认 0.01）。这一步在代码里就是 \texttt{shaped\_r = rewards[:, 1:][act\_mask] - args.kl\_coef * kl}。
+
+有了塑形奖励，就可以算回报与优势。这里要注意本讲实现的一个\textbf{有意简化}：代码注释明确写着，为了教学简洁，这里\textbf{不使用 GAE}，而是直接用「塑形奖励减 value」作为优势。因为本讲只在回答结尾给奖励、中间步没有奖励，塑形奖励可以直接当作 return 使用，于是
+
+$$
+\hat A_t = \tilde r_t - V_\psi(s_t),
+$$
+
+其中 $\hat A_t$ 是优势，$\tilde r_t$ 是上面塑形后的奖励，$V_\psi(s_t)$ 是 value head 对当前上下文的预测。为了让梯度尺度稳定，代码还会对整批优势做标准化：
+
+$$
+\hat A_t \leftarrow \frac{\hat A_t - \mathrm{mean}(\hat A)}
+{\mathrm{std}(\hat A) + \epsilon},
+\qquad \epsilon = 10^{-6},
+$$
+
+其中 $\mathrm{mean}(\hat A)$、$\mathrm{std}(\hat A)$ 是这一批 325 个优势的均值与标准差，$\epsilon$ 防止除零。
+
+\begin{knowledgebox}{标准 PPO 的 GAE，以及本讲为什么可以先不用}
+标准 PPO 用广义优势估计（GAE）在「偏差」与「方差」之间权衡：
+$$
+\delta_t = r_t + \gamma V_\psi(s_{t+1}) - V_\psi(s_t), \qquad
+\hat A_t^{\text{GAE}} = \sum_{l=0}^{T-t}(\gamma\lambda)^{l}\,\delta_{t+l},
+$$
+其中 $\delta_t$ 是 TD 残差（这一步比 critic 预期好多少），$\gamma$ 是折扣因子，$\lambda$ 控制偏差—方差的权衡（$\lambda=0$ 只看一步、$\lambda=1$ 接近 Monte Carlo）。本讲的命令行里保留了 \texttt{--gamma 1.0} 与 \texttt{--lam 0.95} 两个参数，但示例实现为了教学简洁，在「只在结尾给奖励」的前提下直接用塑形奖励当 return，跳过了 GAE 的循环计算。如果你要把它改成标准 PPO（例如带中间奖励、工具回调），把这里换成 GAE 即可，公式与上面的完全一致。
+\end{knowledgebox}
+
+\subsection{PPO 目标与损失函数}
+
+PPO 的核心是「不要一次更新太远」。它用新旧策略在同一动作上的概率比来限制步长：
+
+$$
+\rho_t(\theta) = \frac{\pi_\theta(a_t \mid s_t)}{\pi_{\text{old}}(a_t \mid s_t)}
+= \exp\!\Big(\log \pi_\theta(a_t\mid s_t) - \log \pi_{\text{old}}(a_t\mid s_t)\Big),
+$$
+
+其中 $\rho_t$ 是重要性比率，$\pi_\theta$ 是正在更新的策略，$\pi_{\text{old}}$ 是 rollout 时的策略，$a_t$ 是实际采到的 token。然后用裁剪的代理目标：
+
+$$
+\mathcal{L}^{\text{CLIP}}(\theta)
+= \mathbb{E}_t\Big[\min\big(\rho_t \hat A_t,\ \operatorname{clip}(\rho_t,\,1-\epsilon,\,1+\epsilon)\,\hat A_t\big)\Big],
+$$
+
+其中 $\hat A_t$ 是优势，$\epsilon$ 是裁剪范围（本讲 \texttt{clip\_ratio=0.2}）。直觉：优势为正时，比率涨到 $1+\epsilon$ 就不再给额外奖励；优势为负时，比率跌到 $1-\epsilon$ 就不再额外惩罚——超过这个范围，策略离旧策略太远，继续优化也不可靠。
+
+完整的损失还要加上 value loss 和可选的熵奖励。图~\ref{fig:p8-loss} 是 \texttt{ppo\_loss.py} 的完整源码：策略损失是负的裁剪代理目标；value loss 是 value 与 returns 的均方误差（代码注释说「clip optional，这里用简单 MSE」）；熵用 $-\overline{\log\pi}$ 近似；最后
+
+$$
+\mathcal{L} = \mathcal{L}_{\text{policy}} + c_v\,\mathcal{L}^{\text{VF}} - c_e\,\mathcal{H},
+$$
+
+其中 $\mathcal{L}_{\text{policy}}=-\mathcal{L}^{\text{CLIP}}$ 是策略损失，$c_v$ 是 value 系数（本讲 \texttt{vf\_coef=0.5}），$\mathcal{L}^{\text{VF}}=\frac{1}{N}\sum_t(\hat R_t - V_\psi(s_t))^2$ 是 value loss（$N=325$ 为回答 token 数，$\hat R_t$ 是上面算出的 return），$c_e$ 是熵系数（本讲 \texttt{ent\_coef=0.0}，即不加熵），$\mathcal{H}$ 是策略熵——加熵可以鼓励探索，防止模型过早变得过于确定。
+
+把上面代码翻译成伪代码，就是下面这个关键片段（据课堂代码整理）：
+
+\begin{lstlisting}[caption={PPO 损失函数的核心实现（据 \texttt{ppo\_loss.py} 课堂代码整理）},label={lst:p8-loss}]
+def ppo_losses(new_logp, old_logp, adv, new_values, old_values, returns,
+               clip_ratio=0.2, vf_coef=0.5, ent_coef=0.0):
+    # 1) 策略损失：重要性比率 + 裁剪
+    ratio = torch.exp(new_logp - old_logp)
+    unclipped = ratio * adv
+    clipped = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * adv
+    policy_loss = -torch.mean(torch.min(unclipped, clipped))
+
+    # 2) value 损失：value head 回归 returns
+    value_loss = F.mse_loss(new_values, returns)
+
+    # 3) 熵奖励：用 -logp 的均值近似策略熵
+    entropy = -new_logp.mean()
+
+    # 4) 监控用的近似 KL（不参与总损失）
+    approx_kl = torch.mean(old_logp - new_logp)
+
+    total = policy_loss + vf_coef * value_loss - ent_coef * entropy
+    return PPOLossOut(policy_loss, value_loss, entropy, approx_kl, total)
+\end{lstlisting}
+
+注意 \texttt{old\_values} 在函数签名里出现，但在这个简化实现里并没有进入损失（value loss 直接用 \texttt{returns} 当目标）；\texttt{approx\_kl} 只用于记录，KL 惩罚已经通过「奖励塑形、KL 控制与优势估计」一节的奖励塑形进入训练。另外，demo 里这一段更新\textbf{只跑一次}——代码注释明确写着「This step is done multiple times per batch in practice」，标准 PPO 会对同一批数据做多轮（常见 4--8 轮）mini-batch 更新，这也是 PPO 样本效率的来源。
+
+\begin{center}
+\begin{tabular}{p{3.2cm}p{4.9cm}p{4.9cm}}
+\toprule
+维度 & 本讲的示例实现 & 标准 PPO / 生产实现 \\
+\midrule
+优势估计 & 直接用塑形奖励当 return，\texttt{adv = shaped\_r - old\_values}（无 GAE） & 用 GAE 累积 TD 残差，$\gamma$、$\lambda$ 可调 \\
+KL 惩罚位置 & 从奖励里逐 token 扣除（reward shaping） & 也可作为独立 loss 项；常配自适应 $\beta$ \\
+value 裁剪 & 注释「optional」，直接用 MSE & 常见 value clipping 或双 value 网络 \\
+每批更新轮数 & 单次通过（demo 简化） & 同一批数据多轮 mini-batch 更新 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{训练与评测：日志、KL 变化与 demo 的局限}
+
+训练循环的结构是：采样 rollout $\rightarrow$ 计算 KL/奖励/returns/优势 $\rightarrow$ 标准化优势 $\rightarrow$ 一次 PPO 更新（反向传播 + 梯度裁剪）$\rightarrow$ 记录指标。课程把 50 步训练跑了一遍（图~\ref{fig:p8-log}）：每 10 步打印一次 \texttt{loss}、\texttt{value loss}、\texttt{KL\_move}（这一步策略相对上一步的移动量）与 \texttt{KL\_ref}（策略相对冻结参考模型的累计偏离）。
+
+从日志里能读到三件事：
+
+\begin{itemize}
+\item \textbf{总损失与 value loss 都在下降}：说明策略在改进、critic 对 returns 的预测越来越准（对应讲师说的「value 会越来越好地估计未来奖励」）；
+\item \textbf{KL\_move 很小、KL\_ref 逐步变大}：前者说明单步更新被 PPO 的裁剪与学习率控制住了，后者说明策略确实在慢慢偏离 SFT 参考模型——这正是要看 KL 的原因；
+\item \textbf{评测的平均 RM 奖励是负的（-1.2351）}：在这个 toy 设置下，奖励模型本身就不是很强，训练目标也只是「尽量拿高分」，所以这个数字只能作为对照，不能当作「模型变好」的证据。
+\end{itemize}
+
+评测脚本 \texttt{eval\_ppo.py}（图~\ref{fig:p8-eval}）的做法很直接：加载训练后的 policy 和冻结的 ref，对同一批示例 prompt 分别生成回答并解码，再用奖励模型对「格式化后的 prompt + 回答」打分并取平均。讲师用它对比了训练前后的回答：训练后同一个 prompt 的回答「变成了别的东西」——说明策略确实偏离了 SFT 初始状态；但在这个只有 16 个提示词、两层 Transformer 的 toy 设置里，这种偏离并没有实际意义。
+
+\begin{warningbox}{demo 能跑通不等于 RLHF 有效}
+讲师在结尾特别强调：这个 demo 只有 16 个数据点、一个两层的小模型，奖励模型也不是最好的，所以「这些都不会很有意义，你实际上需要大量的数据」。真正做 RLHF 时要注意：(1) 奖励模型只是人类偏好的\textbf{代理}，策略会学会骗它（reward hacking），表现为回答变长、堆砌讨好词、模板化；(2) 评估不能只看训练奖励，必须看留出偏好集、人工评估与下游指标；(3) 大模型 RLHF 的显存与吞吐开销远高于 SFT，rollout 与四个模型的前向是主要瓶颈。
+\end{warningbox}
+
+把这一讲的实践要点浓缩成一张 checklist：
+
+\begin{itemize}
+\item 三份权重：policy（含 value head，训练）、ref（冻结）、reward model（冻结）；
+\item rollout 记录完整 token 序列、boundary、奖励；上下文超限时只裁 prompt；
+\item 标签右移一位后用 \texttt{log\_softmax + gather} 取 log 概率；所有损失只统计回答 token；
+\item KL 用 \texttt{old\_logp - ref\_logp} 估计，并从奖励中扣除（\texttt{kl\_coef}）；
+\item 优势做标准化、梯度裁剪（1.0）、学习率取小（1e-5）；
+\item demo 单次更新即可跑通；标准 PPO 对同一批数据多轮更新；
+\item 监控 \texttt{KL\_move} 与 \texttt{KL\_ref}，警惕 reward hacking 与灾难性遗忘。
+\end{itemize}
+
+\subsection{本章小结}
+
+\begin{enumerate}
+\item RLHF 在 SFT 与奖励模型之后，用 PPO 优化「奖励模型分数 − KL 惩罚」这一目标；KL 的作用是限制策略偏离 SFT 参考模型、抑制能力退化与灾难性遗忘。
+\item 语言生成就是 MDP：state 是上下文、action 是下一个 token、reward 来自奖励模型（本讲只在结尾给一次）；一个 PPO-RLHF 训练器需要 policy（含 value head）、冻结的 ref 与冻结的 reward model 三份权重。
+\item rollout 要把 prompt 与回答切分、把奖励放在回答最后一个 token 上；上下文超限时只从 prompt 侧裁剪，并用 action mask 精确标出回答 token——mask 错位是最常见的 silent bug。
+\item 本讲用「shift 标签 + log\_softmax + gather」得到 token 级 log 概率；用 \texttt{old\_logp - ref\_logp} 估计 KL 并从奖励中扣除；优势用「塑形奖励 − value」并在批内标准化（示例实现省略了 GAE，但保留 $\gamma,\lambda$ 参数，改起来只差一个循环）。
+\item PPO 用重要性比率与裁剪（$\epsilon=0.2$）限制更新幅度；总损失 = 策略损失 + $c_v\cdot$ value loss − $c_e\cdot$ entropy（本讲 $c_v=0.5$、$c_e=0$），配合梯度裁剪 1.0 与小学习率 1e-5 保证稳定。
+\item 评估不能只看训练奖励：本讲 demo 的 \texttt{Avg RM reward}（-1.2351）只说明策略在逼近一个并不完美的奖励模型；真实 RLHF 需要大量数据、独立评估与对 reward hacking 的防范。
+\end{enumerate}

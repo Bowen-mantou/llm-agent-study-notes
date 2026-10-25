@@ -1,0 +1,600 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>模型算法手写详解</title><style>
+body{font-family:-apple-system,"Microsoft YaHei",sans-serif;max-width:960px;margin:0 auto;padding:24px;line-height:1.7;color:#222}
+h1{border-bottom:3px solid #1a73e8;padding-bottom:8px}
+h2{border-left:5px solid #1a73e8;padding-left:10px;margin-top:32px}
+h3{margin-top:22px;color:#444}
+pre{background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:12px;overflow-x:auto;font-size:13.5px}
+code{font-family:Consolas,"Courier New",monospace;background:#f0f2f5;padding:1px 5px;border-radius:3px}
+pre code{background:none;padding:0}
+table{border-collapse:collapse;margin:12px 0}th,td{border:1px solid #ccc;padding:6px 12px}th{background:#f0f4f8}
+blockquote{border-left:4px solid #1a73e8;margin:10px 0;padding:4px 14px;background:#f5f9ff;border-radius:4px}
+hr{border:none;border-top:1px solid #e1e4e8;margin:24px 0}
+</style>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+ onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+<!-- dsh-site-enhancer:css -->
+<link rel="stylesheet" href="assets/site.css">
+</head><body class="ds-has-topbar" data-site-root="."><h1>模型算法手写详解（零基础版 · 只看这一份就懂）</h1>
+<blockquote>
+<p>每个算法都按同一套顺序讲：<strong>① 这个东西是什么（大白话概念）→ ② 公式（LaTeX）→ ③ 一步一步拆解（拿真数字手算一遍）→ ④ ACM 格式完整代码 → ⑤ 口述要点</strong>。公式在 Markdown Preview Enhanced 里自动渲染成数学符号。
+目录：注意力 / 交叉熵 / GRPO / Flash Attention / KL 散度 / KV cache / RoPE / LoRA &amp; QLoRA</p>
+</blockquote>
+<hr />
+<h2 id="sec-1">一、注意力机制（Attention）与多头注意力（MHA）</h2>
+<h3 id="h3-1">1. 概念：这个东西是什么</h3>
+<p>一句话：<strong>注意力 = 让模型决定「当前这个词，应该重点看句子里哪些其他词」</strong>。</p>
+<p>生活类比：读「小明在河边钓鱼，他钓到一条大的」——「他」指谁？你读的时候自然把「他」和「小明」绑在一起，而不是和「鱼」「河」绑。注意力干的就是这件事：给每两个词算一个「相关程度」，相关程度高的词之间互相传递信息。</p>
+<p>具体到模型：每个词是一个向量。对当前词，问三个问题：</p>
+<ul>
+<li>我在找什么？→ Q（Query，查询向量）</li>
+<li>其他词身上有什么标签？→ K（Key，键向量）</li>
+<li>其他词的实际内容是什么？→ V（Value，值向量）</li>
+</ul>
+<p>流程：拿 Q 和每个 K 做点积 = 相关程度分数 → softmax 把分数变成权重（和为 1）→ 用权重加权平均所有 V = 当前词「看过其他词之后」的新表示。</p>
+<p>Q、K、V 哪来的？同一个词向量 x 分别乘三个可学习的矩阵 Wq、Wk、Wv 得到——这三个矩阵就是注意力要训练的全部参数。</p>
+<h3 id="h3-2">2. 公式（LaTeX）</h3>
+<p>$$Attention(Q, K, V) = softmax\left(\frac{QK^T}{\sqrt{d_k}}\right)V$$</p>
+<p>每一项的意思：</p>
+<ul>
+<li>$QK^T$：n×n 分数矩阵，第 i 行第 j 列 = 词 i 对词 j 的相关性分数（点积）</li>
+<li>$\sqrt{d_k}$：$d_k$ 是每个头的维度，除它把分数方差归一（见 3.3）</li>
+<li>$softmax$：按行归一，每行变成和为 1 的权重</li>
+<li>乘 $V$：权重加权平均，得到输出</li>
+</ul>
+<p>多头版本（同一个东西做 h 遍，各看各的子空间）：</p>
+<p>$$MultiHead(Q,K,V) = Concat(head_1, \dots, head_h)\, W^O, \qquad head_i = Attention(QW_i^Q, KW_i^K, VW_i^V)$$</p>
+<h3 id="h3-3">3. 一步一步拆解（拿真数字手算一遍）</h3>
+<p>设句子有 2 个词（n=2），每个头维度 d_k=2。为省事，假设 Q、K、V 已经投影好了：</p>
+<p>$$Q = \begin{bmatrix} 1 & 0 \\ 0 & 1 \end{bmatrix}, \quad K = \begin{bmatrix} 1 & 0 \\ 0 & 1 \end{bmatrix}, \quad V = \begin{bmatrix} 2 & 3 \\ 4 & 5 \end{bmatrix}$$</p>
+<p><strong>第 1 步：算分数 S = QKᵀ</strong>（第 i 行第 j 列 = 第 i 个词的 Q 与第 j 个词的 K 点积）</p>
+<ul>
+<li>S[0][0] = 1×1 + 0×0 = 1（词 0 看词 0）</li>
+<li>S[0][1] = 1×0 + 0×1 = 0（词 0 看词 1）</li>
+<li>得 $S = \begin{bmatrix} 1 & 0 \\ 0 & 1 \end{bmatrix}$</li>
+</ul>
+<p><strong>第 2 步：除以 √d_k = √2 ≈ 1.414</strong></p>
+<p>$$S = \begin{bmatrix} 0.707 & 0 \\ 0 & 0.707 \end{bmatrix}$$</p>
+<p><strong>第 3 步：softmax 按行归一</strong>。softmax 公式：$softmax(z)_i = \dfrac{e^{z_i}}{\sum_j e^{z_j}}$</p>
+<p>第一行 [0.707, 0]：e^0.707 = 2.028，e^0 = 1，和 = 3.028 → 权重 = [0.669, 0.331]（词 0 把 67% 的注意力放自己身上）</p>
+<p><strong>第 4 步：权重加权平均 V</strong>（第一行输出 = 0.669×V 词0 + 0.331×V 词1）</p>
+<ul>
+<li>0.669 × [2,3] + 0.331 × [4,5] = [1.338+1.324, 2.007+1.655] = <strong>[2.66, 3.66]</strong></li>
+</ul>
+<p><strong>第 5 步（多头）</strong>：把 d 维切成 h 份，每份在自己的子空间里独立走完第 1-4 步，最后把所有头的输出拼起来乘 Wo。为什么多头：不同头学不同的关系（语法、指代、语义），拼起来信息更丰富。</p>
+<p><strong>两个「为什么」</strong>：</p>
+<ul>
+<li><strong>softmax 为什么减 max</strong>：z 很大时 e^z 溢出（e^1000 = inf）。减 max 不改变结果：$\dfrac{e^{z_i-m}}{\sum_j e^{z_j-m}} = \dfrac{e^{z_i}}{\sum_j e^{z_j}}$（分子分母同除 e^m）。</li>
+<li><strong>为什么除 √d_k</strong>：Q、K 元素是零均值独立随机变量时，d_k 项点积的方差 = d_k。不除的话分数很大，softmax 输出接近 one-hot、梯度落在饱和区学不动；除以 √d_k 把方差拉回 1。</li>
+</ul>
+<h3 id="h3-4">4. 手撕标准写法（PyTorch 版 · 面试就写这版，短且标准）</h3>
+<p>先给完整代码，再逐行对应公式和形状。</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import math
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, h, dmodel):
+        super().__init__()
+        self.h = h                                # 头数
+        self.dmodel = dmodel                      # 模型维度
+        self.d_k = dmodel // h                    # 每个头的维度
+        self.w_q = nn.Linear(dmodel, dmodel, bias=False)   # 投影矩阵 Wq（大模型惯例不带偏置，见下文）
+        self.w_k = nn.Linear(dmodel, dmodel, bias=False)   # 投影矩阵 Wk
+        self.w_v = nn.Linear(dmodel, dmodel, bias=False)   # 投影矩阵 Wv
+        self.w_o = nn.Linear(dmodel, dmodel, bias=False)   # 输出投影 Wo
+
+    def forward(self, x, mask=None):
+        batch_size = x.size(0)
+        seq_len = x.size(1)
+        # ① 投影：Q = X·Wq，K = X·Wk，V = X·Wv（形状不变 (batch, seq, dmodel)）
+        query = self.w_q(x)
+        key = self.w_k(x)
+        val = self.w_v(x)
+        # ② 切分多头：(batch, seq, dmodel) → view 成 (batch, seq, h, d_k) → transpose 成 (batch, h, seq, d_k)
+        query = query.view(batch_size, seq_len, self.h, self.d_k).transpose(1, 2)
+        key = key.view(batch_size, seq_len, self.h, self.d_k).transpose(1, 2)
+        val = val.view(batch_size, seq_len, self.h, self.d_k).transpose(1, 2)
+        # ③ QKᵀ / √d_k：key 转置最后两维再矩阵乘 → score (batch, h, seq, seq)
+        score = query @ key.transpose(-1, -2) / math.sqrt(self.d_k)
+        # ④ mask：被屏蔽的位置填 -1e9，softmax 之后概率 ≈ 0
+        if mask is not None:
+            score = score.masked_fill(mask == 0, -1e9)
+        # ⑤ softmax：按最后一维（每个 query 的整行）归一成权重
+        score = torch.softmax(score, dim=-1)
+        # ⑥ 乘 V：权重加权平均 → (batch, h, seq, d_k)
+        score = score @ val
+        # ⑦ 拼接多头：(batch, h, seq, d_k) → transpose 回来 → view 回 (batch, seq, dmodel)
+        score = score.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dmodel)
+        # ⑧ 输出投影
+        return self.w_o(score)
+
+# 测试：序列补全遮罩（padding mask）
+x = torch.randn(2, 10, 512)              # batch=2，seq=10，dmodel=512
+mask = torch.ones(2, 1, 1, 10)           # (batch, 1, 1, seq)，广播后变成 (batch, h, seq, seq)
+mask[:, :, :, -2:] = 0                   # 末尾两个位置是 padding，屏蔽掉
+mha = MultiHeadAttention(h=8, dmodel=512)
+output = mha(x, mask=mask)
+print(x.shape)       # torch.Size([2, 10, 512])
+print(mask.shape)    # torch.Size([2, 1, 1, 10])
+print(output.shape)  # torch.Size([2, 10, 512])
+</code></pre>
+<p><strong>形状跟着走一遍（手撕最容易错的就是形状，背下这张表）</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>变量</th>
+<th>形状</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>输入</td>
+<td>x</td>
+<td>(2, 10, 512)</td>
+</tr>
+<tr>
+<td>① 投影</td>
+<td>q / k / v</td>
+<td>(2, 10, 512)</td>
+</tr>
+<tr>
+<td>② 切分</td>
+<td>view 后 → transpose 后</td>
+<td>(2, 10, 8, 64) → (2, 8, 10, 64)</td>
+</tr>
+<tr>
+<td>③ 分数</td>
+<td>keyᵀ → score</td>
+<td>(2, 8, 64, 10) → (2, 8, 10, 10)</td>
+</tr>
+<tr>
+<td>⑤ 权重</td>
+<td>softmax 后</td>
+<td>(2, 8, 10, 10)</td>
+</tr>
+<tr>
+<td>⑥ 输出</td>
+<td>score @ val</td>
+<td>(2, 8, 10, 64)</td>
+</tr>
+<tr>
+<td>⑦ 拼接</td>
+<td>transpose + view</td>
+<td>(2, 10, 512)</td>
+</tr>
+<tr>
+<td>⑧ 投影</td>
+<td>w_o 后</td>
+<td>(2, 10, 512)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>三个容易问到的点</strong>：</p>
+<ul>
+<li><strong>masked_fill 为什么填 -1e9 而不是 -inf</strong>：softmax 里 e^(-1e9) 直接下溢成 0，效果和 -inf 一样；但 -inf 在某些运算里会出 NaN，所以习惯填 -1e9。</li>
+<li><strong>mask 为什么形状是 (batch, 1, 1, seq)</strong>：广播机制——中间两个 1 自动扩成 (h, seq)，每个头、每个 query 用同一份 mask。padding mask 的意思是「所有词都不看 padding 位置」。另一个常见的是因果遮罩（causal mask，生成时只能看过去）：<code>torch.tril(torch.ones(seq, seq))</code>，把上三角（未来）置 0。</li>
+<li><strong>投影层写不写 bias=False</strong>：原论文的公式是带偏置的（QW^Q + b），nn.Linear 默认 bias=True；但现代大模型（Llama、Qwen 全系）的注意力投影全部 bias=False——层归一化已经做了平移，偏置是冗余的，省参数、略省显存。手撕两种写法都对，写 bias=False 更贴近工业界惯例，面试官问起就说这一句。</li>
+</ul>
+<h3 id="h3-5">5. 口述要点</h3>
+<ol>
+<li>公式：softmax(QKᵀ/√d_k)·V——先算相关性分数，再归一成权重，最后加权平均。</li>
+<li>除 √d_k：点积方差 = d_k，除完方差归 1，softmax 梯度不饱和。</li>
+<li>softmax 减 max：数值稳定，且结果不变。</li>
+<li>多头：不同子空间学不同关系，拼接再过 Wo。</li>
+</ol>
+<hr />
+<h2 id="sec-2">二、交叉熵损失（Cross-Entropy Loss）</h2>
+<h3 id="h3-6">1. 概念：这个东西是什么</h3>
+<p>一句话：<strong>衡量「模型预测的分布」和「真实分布」差多远的一把尺子</strong>——预测得越准，交叉熵越小。</p>
+<p>类比：考试后对答案。真实答案是 C；你预测「A 0.1、B 0.2、C 0.7」→ 交叉熵小（不错）；预测「A 0.33、B 0.33、C 0.34」→ 交叉熵大（蒙的）。它惩罚的不是「错」，而是「对正确答案不够自信」。</p>
+<h3 id="h3-7">2. 公式（LaTeX）</h3>
+<p>$$CE = -\sum_i y_i \log p_i$$</p>
+<ul>
+<li>$y$：真实分布。分类任务里是 one-hot（正确类为 1，其余为 0）</li>
+<li>$p$：模型预测的概率分布</li>
+</ul>
+<p>one-hot 下求和只剩一项，简化为：</p>
+<p>$$CE = -\log p_{正确类}$$</p>
+<p>两个等价关系（面试常考）：</p>
+<p>$$CE(y, p) = H(y) + KL(y \parallel p)$$</p>
+<p>one-hot 时 $H(y) = 0$，所以 <strong>CE = KL 散度</strong>。又因为最大化对数似然 $\log p_{正确类}$ 和最小化 $-\log p_{正确类}$ 是同一件事，所以<strong>最小化交叉熵 = 最大似然估计</strong>。</p>
+<h3 id="h3-8">3. 一步一步拆解（拿真数字手算一遍）</h3>
+<p>3 分类，模型输出的原始分数（logits）= [2.0, 1.0, 0.1]，真实答案是类别 0。</p>
+<p><strong>第 1 步：softmax 转概率</strong>。先减 max（2.0）防溢出 → [0, −1, −1.9]：</p>
+<ul>
+<li>e^0 = 1，e^−1 = 0.368，e^−1.9 = 0.150，和 = 1.518</li>
+<li>p = [0.659, 0.242, 0.099]</li>
+</ul>
+<p><strong>第 2 步：取正确类的概率</strong> p₀ = 0.659。</p>
+<p><strong>第 3 步：取负对数</strong> CE = −log(0.659) = <strong>0.417</strong>。</p>
+<p>感受一下尺度：p₀ = 0.99 → CE = 0.01（很好）；p₀ = 0.5 → CE = 0.693（一般）；p₀ = 0.1 → CE = 2.303（很差）。</p>
+<p><strong>第 4 步（梯度，面试手推必考）</strong>：softmax + 交叉熵对 logits 求导，结果惊人地简洁：</p>
+<p>$$\frac{\partial CE}{\partial z} = p - y$$</p>
+<p>预测概率减真实 one-hot。例：z = [2.0, 1.0, 0.1]，y = [1, 0, 0]，p = [0.659, 0.242, 0.099] → 梯度 = [−0.341, 0.242, 0.099]。反向传播就按这个更新。</p>
+<h3 id="h3-9">4. ACM 格式完整代码</h3>
+<pre><code class="language-python">import sys
+import math
+
+def cross_entropy(logits, y):
+    # logits: [C] 未归一化分数；y: 真实类别下标（0 ~ C-1）
+    mx = max(logits)                          # 第 1 步：减 max，数值稳定
+    ex = [math.exp(v - mx) for v in logits]   # 第 2 步：指数
+    s = sum(ex)                               # 第 3 步：分母（softmax）
+    log_p = math.log(ex[y]) - math.log(s)     # 第 4 步：log_softmax 取正确类
+    return -log_p                             # 第 5 步：CE = -log p_正确类
+
+def main():
+    # 输入：第一行 C；第二行 C 个 logits；第三行真实类别下标 y
+    data = sys.stdin.read().split()
+    if not data: return
+    C = int(data[0])
+    logits = [float(x) for x in data[1:1 + C]]
+    y = int(data[1 + C])
+    print(f&quot;{cross_entropy(logits, y):.4f}&quot;)
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre>
+<h3 id="h3-10">5. 口述要点</h3>
+<ol>
+<li>公式 −Σ y·log p，one-hot 下就是 −log p_正确类——模型对正确答案越自信，损失越小。</li>
+<li>最小化交叉熵 = 最大化对数似然；且 CE = H(y) + KL(y∥p)，one-hot 时 CE 就是 KL 散度。</li>
+<li>数值稳定：softmax 前减 max 或用 log_softmax。</li>
+<li>黄金梯度：∂CE/∂z = p − y，预测概率减真实标签。</li>
+</ol>
+<hr />
+<h2 id="sec-3">三、GRPO 损失（组相对策略优化）</h2>
+<h3 id="h3-11">1. 概念：这个东西是什么</h3>
+<p>一句话：<strong>强化学习训练语言模型的损失函数——同一道题生成一组答案，组内互相比好坏，好的往上拉、坏的往下压，不需要额外的评委模型（价值模型/critic）</strong>。</p>
+<p>类比：考试不比绝对分数线，而是同班同学互相比。题难大家都低分、题易大家都高分——减去组内均值后，难度因素自动抵消，剩下的就是「这个答案比平均好多少」。</p>
+<p>背景链条（30 秒版）：模型生成答案 → 打分（奖励）→ 构造「优势」（这个答案比组内平均好多少）→ 用损失函数让模型提高高分答案的概率。GRPO 就是最后这一步的损失函数。</p>
+<h3 id="h3-12">2. 公式（LaTeX）</h3>
+<p>组内优势（GRPO 的核心，替代 PPO 的价值模型）：</p>
+<p>$$A_i = \frac{r_i - \mu_{group}}{\sigma_{group}}$$</p>
+<p>概率比（新策略和旧策略的差距）：</p>
+<p>$$\rho = \frac{\pi_\theta(y_i|x)}{\pi_{old}(y_i|x)} = \exp(\log p_{new} - \log p_{old})$$</p>
+<p>损失（clip 保守更新 − KL 惩罚）：</p>
+<p>$$\mathcal{L} = -\Big[\min\big(\rho A,\ \text{clip}(\rho, 1-\epsilon, 1+\epsilon)\,A\big) - \beta \cdot KL\Big]$$</p>
+<h3 id="h3-13">3. 一步一步拆解（拿真数字手算一遍）</h3>
+<p>同一道题 4 个答案（组大小 = 4），奖励 r = [0.5, 1.0, 0.2, 0.9]。</p>
+<p><strong>第 1 步：组内均值</strong> μ = (0.5 + 1.0 + 0.2 + 0.9) / 4 = <strong>0.65</strong></p>
+<p><strong>第 2 步：组内标准差</strong> σ = √(((0.5−0.65)² + (1−0.65)² + (0.2−0.65)² + (0.9−0.65)²) / 4) = √((0.0225 + 0.1225 + 0.2025 + 0.0625)/4) = √0.1025 ≈ <strong>0.320</strong></p>
+<p><strong>第 3 步：优势</strong> A = (r − μ) / σ = [−0.469, 1.094, −1.406, 0.781]——答案 2（奖励 1.0）是组内最好的，优势最大；答案 3（0.2）最差。</p>
+<p><strong>第 4 步：概率比 ρ</strong> = 新策略概率 ÷ 旧策略概率。假设答案 2 的新旧对数概率差为 0.1 → ρ = e^0.1 ≈ 1.105（新策略更喜欢它了，要顺着推一把）。</p>
+<p><strong>第 5 步：clip 截断</strong>（ε = 0.2）：A &gt; 0 时 ρ 上限 1.2、A &lt; 0 时 ρ 下限 0.8，然后取 min(ρA, clip(ρ)A)——<strong>永远取保守侧</strong>，防止一步更新走太远。</p>
+<p><strong>第 6 步：KL 惩罚</strong>：拉回参考模型（训练前的模型），防偏离太远。两种估计：</p>
+<p>$$k_1 = \tfrac{1}{2}\,diff^2 \qquad k_3 = diff - 1 + e^{-diff}$$</p>
+<p>其中 <strong>diff = 当前对数概率 − 参考对数概率</strong>（新减旧）。三个事实：diff 本身就是无偏的 KL 散度估计（E[diff] = KL）；k1 是平方近似（非负、<strong>有偏</strong>、最常用）；k3 = diff − 1 + e^(−diff) <strong>无偏且恒非负</strong>——把 e^(−diff) 记作 r（r = 参考概率 ÷ 当前概率），k3 就是 r − 1 − log r，而 log r ≤ r − 1 恒成立。注意方向不能反：如果 diff 定义成「参考减当前」，k3 估计的就变成 χ² − KL 了。</p>
+<p><strong>第 7 步：负号</strong>：优化器默认最小化，最大化目标要加负号。</p>
+<p><strong>为什么组内互比就够</strong>：同一道题的答案互相比，减均值后题目难度自动抵消，不需要一个额外的价值模型来估计「期望得分」——这就是 GRPO 比 PPO 省一半显存的原因（PPO 要同时训价值模型）。</p>
+<h3 id="h3-14">4. ACM 格式完整代码</h3>
+<pre><code class="language-python">import sys
+import math
+
+def grpo_loss(logprobs, rewards, group_size, eps=0.2, beta=0.001, ref_logprobs=None, kl_type=&quot;k1&quot;):
+    # logprobs: 概率比的对数（= 新 logp - 旧 logp，速记简化）；rewards: 奖励
+    # 每 group_size 个是同一道题的组
+    n = len(logprobs)
+    assert n % group_size == 0
+    total = 0.0
+    for g in range(0, n, group_size):
+        r = rewards[g:g + group_size]
+        mean_r = sum(r) / group_size                          # 第 1 步：组内均值
+        std_r = (sum((x - mean_r) ** 2 for x in r) / group_size) ** 0.5 + 1e-9  # 第 2 步：标准差
+        A = [(x - mean_r) / std_r for x in r]                 # 第 3 步：优势
+        for j in range(group_size):
+            rho = math.exp(logprobs[g + j])                   # 第 4 步：概率比
+            clipped = min(rho, 1 + eps) if A[j] &gt;= 0 else max(rho, 1 - eps)    # 第 5 步：clip
+            surr = min(rho * A[j], clipped * A[j])            # 取保守侧
+            kl = 0.0
+            if ref_logprobs is not None:                      # 第 6 步：KL 惩罚
+                diff = logprobs[g + j] - ref_logprobs[g + j]  # 方向：当前减参考（新减旧）
+                if kl_type == &quot;k1&quot;:
+                    kl = 0.5 * diff ** 2                      # 平方近似（有偏，最常用）
+                elif kl_type == &quot;k3&quot;:
+                    kl = diff - 1 + math.exp(-diff)           # 无偏且恒非负
+            total += -(surr - beta * kl)                      # 第 7 步：负号变最小化
+    return total / n
+
+def main():
+    # 输入：第一行 n group_size eps beta；第二行 n 个 logprobs；第三行 n 个 rewards
+    # （可选第四行 n 个 ref_logprobs，没有则 KL=0）
+    data = sys.stdin.read().split()
+    if not data: return
+    n, gs = int(data[0]), int(data[1])
+    eps, beta = float(data[2]), float(data[3])
+    idx = 4
+    logprobs = [float(x) for x in data[idx:idx + n]]; idx += n
+    rewards = [float(x) for x in data[idx:idx + n]]; idx += n
+    ref = [float(x) for x in data[idx:idx + n]] if len(data) - idx &gt;= n else None
+    print(f&quot;{grpo_loss(logprobs, rewards, gs, eps, beta, ref):.4f}&quot;)
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre>
+<h3 id="h3-15">5. 口述要点</h3>
+<ol>
+<li>核心：组内归一化优势 A = (r − mean) / std，同题一组答案互相比，不需要 critic。</li>
+<li>clip：限制更新幅度防策略跑飞，min 取保守侧。</li>
+<li>KL：拉回参考模型；diff = 当前减参考，k1 平方近似（有偏）、k3 = diff − 1 + e^(−diff) 无偏且恒非负。</li>
+<li>和 PPO 的区别：PPO 用价值模型估计优势（多一个模型），GRPO 用组内互比替代——省显存。</li>
+</ol>
+<hr />
+<h2 id="sec-4">四、Flash Attention</h2>
+<h3 id="h3-16">1. 概念：这个东西是什么</h3>
+<p>一句话：<strong>算得更快、显存更省的注意力实现——结果和标准注意力完全一样，只是把「怎么读写中间结果」换了种方式</strong>。</p>
+<p>背景：GPU 有两级存储——<strong>SRAM</strong>（片上小存储，读写快但只有几十 KB 到几百 KB）和 <strong>HBM</strong>（显存，容量大但读写慢）。标准注意力把 n×n 的分数矩阵整个写进 HBM 再读回来，序列一长，这个读写就成了瓶颈（显存占用 O(n²)）。</p>
+<p>Flash Attention 的招：把矩阵<strong>切块</strong>，每次只搬一小块进 SRAM 算，算完就丢——n×n 矩阵从头到尾<strong>不落地</strong>，显存降到 O(n)。</p>
+<h3 id="h3-17">2. 公式（LaTeX）</h3>
+<p>关键组件是「在线 softmax」——普通 softmax 要一次看完整行，在线 softmax 允许一块一块来，用两个变量修正：</p>
+<p>$$m_{new} = \max(m_{old},\ m_{block}), \qquad l_{new} = l_{old} \cdot e^{\,m_{old} - m_{new}} + \sum_{block} e^{\,x - m_{new}}$$</p>
+<p>（m = 目前见过的最大值；l = 分母累加和。来新块时，先把旧分母按新旧 max 的差值缩放，再加新块。）</p>
+<h3 id="h3-18">3. 一步一步拆解（拿真数字手算一遍）</h3>
+<p>某一行分数，先来一块 [1, 2]，又来一块 [3]。</p>
+<p><strong>第 1 块 [1, 2]</strong>：m = 2；l = e^(1−2) + e^(2−2) = 0.368 + 1 = 1.368；块内 softmax = [0.269, 0.731]</p>
+<p><strong>第 2 块 [3] 来了</strong>：m_new = max(2, 3) = 3；旧分母缩放：1.368 × e^(2−3) = 0.503；加新块：+ e^(3−3) = 1 → l_new = 1.503</p>
+<p><strong>最终结果</strong> = [e^(1−3), e^(2−3), e^(3−3)] / 1.503 = [0.135, 0.368, 1] / 1.503 = [0.090, 0.245, 0.665]</p>
+<p>验证：一次性算 [1,2,3] → [e^1, e^2, e^3] / 20.086 = [2.718, 7.389, 20.086]/20.086 = [0.135, 0.368, 1.000] 归一 = [0.090, 0.245, 0.665]——<strong>完全一样</strong>。</p>
+<p>关键结论：分块算 + 两个修正变量，结果<strong>精确相等</strong>（不是近似），但 n×n 矩阵不落地，显存 O(n²) → O(n)，速度 2-4 倍。配套的 FlashDecoding 用来并行化解码阶段。</p>
+<h3 id="h3-19">4. 为什么面试只考口述不考手写</h3>
+<p>实现是 CUDA 内核层面的代码（要直接操作 GPU 存储层级），面试手撕不会要求写。能讲清楚上面三个环节（瓶颈、分块、在线 softmax、结果精确相等）就是满分。如果想展示深入，补一句「tiling 的块大小要刚好塞进 SRAM」。</p>
+<h3 id="h3-20">5. 口述要点</h3>
+<ol>
+<li>标准注意力的瓶颈是显存带宽不是算力——n×n 矩阵要来回读写 HBM。</li>
+<li>FlashAttention 分块 + 在线 softmax（两个修正变量 m、l），显存 O(n²) → O(n)。</li>
+<li>结果精确相等（不是近似），只是换了计算顺序。</li>
+</ol>
+<hr />
+<h2 id="sec-5">五、KL 散度</h2>
+<h3 id="h3-21">1. 概念：这个东西是什么</h3>
+<p>一句话：<strong>衡量两个分布差多远的尺子</strong>。注意它<strong>不对称</strong>——从 A 量到 B 和从 B 量到 A，数字不一样。</p>
+<h3 id="h3-22">2. 公式（LaTeX）</h3>
+<p>$$KL(P \parallel Q) = \sum_x P(x) \log \frac{P(x)}{Q(x)}$$</p>
+<p>读法：在 P 的每个取值上，看「P 的概率比 Q 大多少倍」取对数，再用 P 自己的概率加权平均。</p>
+<h3 id="h3-23">3. 一步一步拆解（拿真数字手算，顺便看清不对称）</h3>
+<p>老师 P = [0.7, 0.2, 0.1]，学生 Q = [0.1, 0.8, 0.1]（学生把老师最看好的第一类学歪了）。</p>
+<p><strong>KL(P∥Q)</strong>（以老师的眼光量学生）：</p>
+<ul>
+<li>第一类：0.7 × log(0.7/0.1) = 0.7 × 1.946 = 1.362（老师最看好的地方学生没学会，罚得重）</li>
+<li>第二类：0.2 × log(0.2/0.8) = 0.2 × (−1.386) = −0.277</li>
+<li>第三类：0.1 × log(0.1/0.1) = 0</li>
+<li>合计 = <strong>1.085</strong></li>
+</ul>
+<p><strong>KL(Q∥P)</strong>（以学生的眼光量老师）：</p>
+<ul>
+<li>第一类：0.1 × log(0.1/0.7) = −0.195</li>
+<li>第二类：0.8 × log(0.8/0.2) = 0.8 × 1.386 = 1.109（学生敢在老师不看好的地方说话，罚爆炸）</li>
+<li>第三类：0</li>
+<li>合计 = <strong>0.914</strong></li>
+</ul>
+<p>1.085 ≠ 0.914 → 不对称 ✓。而且能看出行为差异：</p>
+<ul>
+<li><strong>前向 KL(P真实 ∥ Q学生)</strong>：真实分布高的地方学生必须高——<strong>覆盖式</strong>（宁滥勿缺，老师的所有高峰都要沾）。</li>
+<li><strong>后向 KL(Q学生 ∥ P老师)</strong>：学生在老师概率低的地方说多了惩罚爆炸——<strong>主模式式</strong>（宁缺勿滥，只追老师主峰）。</li>
+</ul>
+<p>和交叉熵的关系（面试高频）：$CE(P,Q) = H(P) + KL(P \parallel Q)$——交叉熵 = 真实分布自己的熵 + KL 散度。one-hot 时 H(P) = 0，两者相等。</p>
+<p><strong>SFT 与前向 KL 的对应（加分点）</strong>：H(数据) 是常数 → 最小化交叉熵 ≡ 最小化<strong>前向</strong> KL(数据 ∥ 学生)。所以 SFT 本质是前向 KL：覆盖式——老师轨迹里每个模式都要沾，这就是「背答案」的数学本质。OPD 用后向 KL：主模式式——学生写到哪老师批到哪。前向覆盖全但会学老师的长尾噪声、不探索；后向不发散但可能漏次要模式。</p>
+<p>我的项目里：在线策略蒸馏用逐词<strong>后向 KL</strong>（veRL 低方差 KL）——蒸馏只追老师主峰，选后向合理；GRPO 里 KL 当惩罚项拉回参考模型，k1/k3 是它的两种估计。</p>
+<h3 id="h3-24">4. ACM 格式完整代码</h3>
+<pre><code class="language-python">import sys
+import math
+
+def kl_divergence(p, q):
+    # p, q: 两个等长概率分布（各项 &gt; 0 时才能取对数）
+    return sum(p[i] * math.log(p[i] / q[i]) for i in range(len(p)) if p[i] &gt; 0)
+
+def main():
+    # 输入：第一行 n；第二行 n 个 p；第三行 n 个 q
+    data = sys.stdin.read().split()
+    if not data: return
+    n = int(data[0])
+    p = [float(v) for v in data[1:1 + n]]
+    q = [float(v) for v in data[1 + n:1 + 2 * n]]
+    print(f&quot;KL(P||Q) = {kl_divergence(p, q):.4f}&quot;)
+    print(f&quot;KL(Q||P) = {kl_divergence(q, p):.4f}&quot;)   # 顺便演示不对称
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre>
+<h3 id="h3-25">5. 口述要点</h3>
+<ol>
+<li>不对称——方向决定行为：前向 = 覆盖式（宁滥勿缺），后向 = 主模式式（宁缺勿滥）。</li>
+<li>CE = H(P) + KL(P∥Q)，one-hot 下 CE 就是 KL。</li>
+<li>蒸馏选后向 KL（追老师主峰）；GRPO 用它当惩罚拉回参考模型。</li>
+</ol>
+<hr />
+<h2 id="sec-6">六、KV cache</h2>
+<h3 id="h3-26">1. 概念：这个东西是什么</h3>
+<p>一句话：<strong>自回归生成时，把已经算过的历史 K 和 V 存起来，下一个词只算新词的注意力，不重算历史——用显存换时间</strong>。</p>
+<p>自回归生成是一词一词往外蹦，第 t 步生成第 t 个词，它要和前面所有词算注意力。没有缓存：每步把全部历史重算一遍；有缓存：历史 K、V 直接复用。</p>
+<h3 id="h3-27">2. 公式（LaTeX）</h3>
+<p>计算量对比（n 个词，每步注意力是矩阵乘法）：</p>
+<p>$$\text{无缓存}: \sum_{t=1}^{n} O(t^2) = O(n^3) \qquad \text{有缓存}: \sum_{t=1}^{n} O(t) = O(n^2)$$</p>
+<p>显存开销：</p>
+<p>$$\text{KV 显存} = 2 \times \text{层数} \times \text{序列长} \times \text{维度} \times \text{精度字节}$$</p>
+<p>（×2 因为 K、V 各一份。例：32 层、维度 4096、fp16、2048 token → 2×32×2048×4096×2 ≈ 1 GB）</p>
+<h3 id="h3-28">3. 一步一步拆解</h3>
+<p><strong>第 1 步</strong>：预填充阶段——提示词整体进来，一次算完所有 token 的 K、V，全部存进 cache。这个阶段算力密集（大量并行矩阵乘法）。</p>
+<p><strong>第 2 步</strong>：解码阶段——每步只算新词的 Q，和 cache 里全部 K、V 做注意力；新词的 K、V 追加进 cache。这个阶段算力很小，但每步都要把整个 cache 读一遍——<strong>显存带宽密集</strong>。</p>
+<p><strong>第 3 步（直观对比）</strong>：n = 1000 时，无缓存总计算量 O(n³) 级，有缓存 O(n²) 级——差 1000 倍。</p>
+<p><strong>优化方向（面试加分）</strong>：KV 量化（8bit/4bit 压缩存储）、PagedAttention（vLLM 把 cache 分页管理，防显存碎片）、MLA（DeepSeek 把 KV 低秩压缩再存）。</p>
+<p><strong>和我的 vLLM 项目的联系</strong>：请求准入要预留整条序列的显存，预留的就是 KV cache——显存紧张时长请求占满 KV 空间堵住短请求，我做的长度配对调度治的就是这个。</p>
+<h3 id="h3-29">4. ACM 格式演示代码（无缓存 vs 有缓存，结果一致）</h3>
+<pre><code class="language-python">import sys
+import math
+
+def softmax(x):
+    mx = max(x)
+    e = [math.exp(v - mx) for v in x]
+    s = sum(e)
+    return [v / s for v in e]
+
+def naive_decode(X):
+    # 无缓存：每步把历史 K、V 重新算一遍（慢，O(n^3) 总量）
+    n, d = len(X), len(X[0])
+    outs = []
+    for t in range(n):
+        K, V = X[:t+1], X[:t+1]               # 全部重算
+        q = X[t]
+        scores = [sum(q[i] * K[j][i] for i in range(d)) / math.sqrt(d) for j in range(t+1)]
+        w = softmax(scores)
+        outs.append([sum(w[j] * V[j][i] for j in range(t+1)) for i in range(d)])
+    return outs
+
+def cached_decode(X):
+    # 有缓存：历史 K、V 直接复用，每步只追加新词（快，O(n^2) 总量）
+    n, d = len(X), len(X[0])
+    K, V = [], []
+    outs = []
+    for t in range(n):
+        K.append(X[t]); V.append(X[t])        # 只存新词的 K、V
+        q = X[t]
+        scores = [sum(q[i] * K[j][i] for i in range(d)) / math.sqrt(d) for j in range(t+1)]
+        w = softmax(scores)
+        outs.append([sum(w[j] * V[j][i] for j in range(t+1)) for i in range(d)])
+    return outs
+
+def main():
+    # 输入：第一行 n d；接下来 n 行词向量 X（演示用 Wq=Wk=Wv=I 简化）
+    data = sys.stdin.read().split()
+    if not data: return
+    n, d = int(data[0]), int(data[1])
+    X = [[float(data[2 + i*d + j]) for j in range(d)] for i in range(n)]
+    a, b = naive_decode(X), cached_decode(X)
+    same = all(abs(a[i][j] - b[i][j]) &lt; 1e-9 for i in range(n) for j in range(d))
+    print(&quot;naive == cached:&quot;, same)           # 两种方式输出完全一致
+    for row in b:
+        print(&quot; &quot;.join(f&quot;{v:.4f}&quot; for v in row))
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre>
+<h3 id="h3-30">5. 口述要点</h3>
+<ol>
+<li>省的是重复计算：总量 O(n³) → O(n²)，用显存换时间。</li>
+<li>两个阶段：预填充算力密集、解码显存带宽密集。</li>
+<li>优化三板斧：量化、分页（PagedAttention）、低秩压缩（MLA）。</li>
+</ol>
+<hr />
+<h2 id="sec-7">七、RoPE（旋转位置编码）</h2>
+<h3 id="h3-31">1. 概念：这个东西是什么</h3>
+<p>一句话：<strong>给词向量加「位置信息」的方法——把向量在它自己的子空间里转一个角度，角度大小由位置决定</strong>。位置差多少，相对转角就多少。</p>
+<p>注意力本身没有顺序概念（「A 打 B」和「B 打 A」在纯注意力里一样），位置编码就是补上顺序信息。RoPE 的做法不是把位置向量拼进去，而是<strong>旋转</strong>——词向量本身不变，只是转了个方向，转的角度编码了位置。</p>
+<h3 id="h3-32">2. 公式（LaTeX）</h3>
+<p>对向量的每两个维度一组，乘 2×2 旋转矩阵：</p>
+<p>$$\begin{pmatrix} x' \\ y' \end{pmatrix} = \begin{pmatrix} \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta \end{pmatrix} \begin{pmatrix} x \\ y \end{pmatrix}, \qquad \theta_j = m \cdot base^{-2j/d}$$</p>
+<p>（m 是位置，d 是维度，j 是第 j 对维度，base 默认 10000。）</p>
+<p>关键性质——两个位置的旋转点积只依赖位置差：</p>
+<p>$$(R_{\theta,m}\, q) \cdot (R_{\theta,n}\, k) = q \cdot R_{\theta,\,n-m}\, k$$</p>
+<p>所以 RoPE 天然是<strong>相对位置编码</strong>。</p>
+<h3 id="h3-33">3. 一步一步拆解（拿真数字手算一遍）</h3>
+<p>2 维向量 q = [1, 0]（想象指向右边的箭头），位置 m = 1，θ = 0.5 弧度：</p>
+<ul>
+<li>x' = 1×cos(0.5) − 0×sin(0.5) = 0.878</li>
+<li>y' = 1×sin(0.5) + 0×cos(0.5) = 0.479</li>
+</ul>
+<p>→ q 逆时针转了 0.5 弧度，变成 [0.878, 0.479]。位置 m = 2 时转 1.0 弧度。两个位置的相对转角 = 1.0 − 0.5 = 0.5 = 位置差 × θ——这就是「点积只依赖相对位置」的直观含义。</p>
+<p><strong>频率分布</strong>：θ_j = base^(−2j/d)，j 越小 θ 越大——靠前的维度转得快（精细区分近距离位置），靠后的维度转得慢（粗略编码远距离）。</p>
+<p><strong>长文本外推</strong>：序列超过训练长度时，位置角超出训练见过的范围，性能掉——调大 base（NTK-aware 缩放）让旋转变慢，就能外推到更长文本。</p>
+<h3 id="h3-34">4. ACM 格式完整代码</h3>
+<pre><code class="language-python">import sys
+import math
+
+def rope(q, pos, base=10000.0):
+    # q: [d]（d 为偶数），按位置 pos 旋转
+    d = len(q)
+    out = q[:]
+    for j in range(d // 2):                  # 每两个维度一组
+        theta = base ** (-2 * j / d)         # 第 j 对的旋转频率
+        c, s = math.cos(pos * theta), math.sin(pos * theta)
+        x, y = q[2*j], q[2*j+1]
+        out[2*j], out[2*j+1] = x * c - y * s, x * s + y * c   # 旋转矩阵乘法
+    return out
+
+def main():
+    # 输入：第一行 d pos；第二行 d 个 q
+    data = sys.stdin.read().split()
+    if not data: return
+    d, pos = int(data[0]), int(data[1])
+    q = [float(x) for x in data[2:2 + d]]
+    out = rope(q, pos)
+    print(&quot; &quot;.join(f&quot;{v:.4f}&quot; for v in out))
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre>
+<h3 id="h3-35">5. 口述要点</h3>
+<ol>
+<li>旋转矩阵乘 q/k，角度和位置成正比——位置信息存在「转了多少」里。</li>
+<li>点积只依赖相对位置：两个向量转的角度差就是位置差。</li>
+<li>维度越低频率越高（前细后粗）；长文本外推靠调大 base。</li>
+</ol>
+<hr />
+<h2 id="sec-8">八、LoRA &amp; QLoRA（低秩适配 &amp; 量化低秩适配）</h2>
+<h3 id="h3-36">1. 概念：这个东西是什么</h3>
+<p>一句话：<strong>微调大模型时冻结原权重、只训练一小撮新参数——省钱省显存，效果接近全参微调</strong>。</p>
+<p>直觉：微调只是「微」调——权重变化其实集中在少数几个方向上。既然改动是「低秩」的，就用两个小矩阵的乘积 B·A 来表达整个改动，不用动原权重。</p>
+<h3 id="h3-37">2. 公式（LaTeX）</h3>
+<p>$$W' = W + \frac{\alpha}{r}\, B A, \qquad B \in \mathbb{R}^{out \times r},\ A \in \mathbb{R}^{r \times in}$$</p>
+<ul>
+<li>W：冻结的原权重，训练时不更新</li>
+<li>B、A：可训练的小矩阵，r 很小（8-64）</li>
+<li>α/r：缩放系数，控制增量强度</li>
+<li>初始化：A 高斯随机、B 全零——开始时 B·A = 0，模型行为完全不变</li>
+</ul>
+<h3 id="h3-38">3. 一步一步拆解（拿真数字算参数量）</h3>
+<p>W 是 4096×4096 = 16,777,216 个参数。取 r = 32：</p>
+<ul>
+<li>A：32×4096 = 131,072</li>
+<li>B：4096×32 = 131,072</li>
+<li>合计 262,144 —— 只有原来的 <strong>1.6%</strong></li>
+</ul>
+<p>为什么有效：微调对权重的改动是低秩的（真正需要调整的方向只有少数几个），两个小矩阵就能表达大部分改动。</p>
+<p><strong>QLoRA 三件套</strong>（在 LoRA 基础上再省显存，单卡 24G 就能微调几十 B 的模型）：</p>
+<ol>
+<li><strong>4 比特 NF4 量化存基座</strong>：原权重用 4 比特格式存放，前向时反量化回来算——量化的是「存储」不是「计算」，精度损失很小</li>
+<li><strong>双重量化</strong>：连量化用的缩放系数也量化一次，再省一点</li>
+<li><strong>分页优化器</strong>：显存不够时优化器状态自动换页到内存，防突然爆显存</li>
+</ol>
+<p><strong>我的项目实配</strong>（被问「你微调怎么做的」直接报）：两个项目的监督微调都用 QLoRA——搜索项目秩 32、缩放 64、4 比特，训出的增量权重只有 82MB，最后合并回基座；强化学习阶段上全参数（要冲上限，低秩容量会成为瓶颈）。一句话：「监督微调省钱、强化学习上全参」。</p>
+<h3 id="h3-39">4. ACM 格式完整代码</h3>
+<pre><code class="language-python">import sys
+
+def lora_forward(x, W, A, B, alpha, r):
+    # y = Wx + (α/r)·B·A·x；只有 A、B 参与训练，W 冻结
+    out_d, in_d = len(W), len(x)
+    Wx = [sum(W[i][j] * x[j] for j in range(in_d)) for i in range(out_d)]       # 冻结部分
+    Ax = [sum(A[k][j] * x[j] for j in range(in_d)) for k in range(r)]           # A·x: [r]
+    BAx = [sum(B[i][k] * Ax[k] for k in range(r)) for i in range(out_d)]        # B·(A·x): [out]
+    scale = alpha / r
+    return [Wx[i] + scale * BAx[i] for i in range(out_d)]
+
+def main():
+    # 输入：第一行 out_d in_d r alpha；第二行 x；接着 out_d 行 W；r 行 A；out_d 行 B
+    data = sys.stdin.read().split()
+    if not data: return
+    out_d, in_d, r = int(data[0]), int(data[1]), int(data[2])
+    alpha = float(data[3])
+    idx = 4
+    x = [float(v) for v in data[idx:idx + in_d]]; idx += in_d
+    W = [[float(data[idx + i * in_d + j]) for j in range(in_d)] for i in range(out_d)]; idx += out_d * in_d
+    A = [[float(data[idx + k * in_d + j]) for j in range(in_d)] for k in range(r)]; idx += r * in_d
+    B = [[float(data[idx + i * r + k]) for k in range(r)] for i in range(out_d)]
+    y = lora_forward(x, W, A, B, alpha, r)
+    print(&quot; &quot;.join(f&quot;{v:.4f}&quot; for v in y))
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre>
+<h3 id="h3-40">5. 口述要点</h3>
+<ol>
+<li>冻结 W 只训 B·A，参数量千分之一；α/r 控制增量强度；B 初始化为 0 保证起点不变。</li>
+<li>QLoRA = 4 比特 NF4 存基座 + 双重量化 + 分页优化器。</li>
+<li>我的监督微调用 QLoRA（秩 32/缩放 64/82MB），强化学习上全参；量化的是存储不是计算，效果接近全参。</li>
+</ol>
+<!-- dsh-site-enhancer:js -->
+<script src="assets/site.js"></script>
+</body></html>

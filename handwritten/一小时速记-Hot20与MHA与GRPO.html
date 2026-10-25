@@ -1,0 +1,717 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>一小时速记-Hot20与MHA与GRPO</title><style>
+body{font-family:-apple-system,"Microsoft YaHei",sans-serif;max-width:960px;margin:0 auto;padding:24px;line-height:1.7;color:#222}
+h1{border-bottom:3px solid #1a73e8;padding-bottom:8px}
+h2{border-left:5px solid #1a73e8;padding-left:10px;margin-top:32px}
+h3{margin-top:22px;color:#444}
+pre{background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:12px;overflow-x:auto;font-size:13.5px}
+code{font-family:Consolas,"Courier New",monospace;background:#f0f2f5;padding:1px 5px;border-radius:3px}
+pre code{background:none;padding:0}
+table{border-collapse:collapse;margin:12px 0}th,td{border:1px solid #ccc;padding:6px 12px}th{background:#f0f4f8}
+blockquote{border-left:4px solid #1a73e8;margin:10px 0;padding:4px 14px;background:#f5f9ff;border-radius:4px}
+hr{border:none;border-top:1px solid #e1e4e8;margin:24px 0}
+</style>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+ onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+<!-- dsh-site-enhancer:css -->
+<link rel="stylesheet" href="assets/site.css">
+</head><body class="ds-has-topbar" data-site-root="."><h1>一小时速记：Hot 20 逐题 + MHA / GRPO / 交叉熵手写 + 五个高频口述题</h1>
+<blockquote>
+<p>用法：Hot 20 每道按「题干 → 思路 → 代码」过一遍，重点标自己还写不出来的；后半部分 MHA、GRPO、交叉熵三个手写要能默，Flash Attention、KL 散度、KV cache、RoPE、LoRA/QLoRA 五个口述要能说。</p>
+</blockquote>
+<hr />
+<h2 id="sec-1">一、Hot 20 逐题速记（题干 + 思路 + 最小代码）</h2>
+<h3 id="h3-1">1. 字母异位词分组（哈希）</h3>
+<p><strong>题干</strong>：给一组字符串，把字母相同、排列不同的词分到同一组。例：<code>["eat","tea","tan","ate","nat","bat"]</code> → <code>[["bat"],["nat","tan"],["ate","eat","tea"]]</code>。</p>
+<p><strong>思路</strong>：每个词排序后作键（eat → aet），哈希表分组。看到「分组、去重、计数」先想哈希表。</p>
+<pre><code class="language-python">def groupAnagrams(strs):
+    from collections import defaultdict
+    d = defaultdict(list)
+    for s in strs:
+        key = &quot;&quot;.join(sorted(s))          # 排序做键
+        d[key].append(s)
+    return list(d.values())
+</code></pre>
+<p>复杂度：n 个词、词长 k → O(n·k·log k)。</p>
+<h3 id="h3-2">2. 三数之和（双指针）</h3>
+<p><strong>题干</strong>：找所有和为 0 且不重复的三元组。</p>
+<p><strong>思路</strong>：排序 → 固定 i → 对撞双指针 l/r 找两数之和为 -nums[i] → 三处去重（i 跳过相同值；找到答案后 l、r 各跳过相同值）。看到「固定一个 + 剩下两个」就是对撞双指针。</p>
+<pre><code class="language-python">def threeSum(nums):
+    nums.sort()
+    n, res = len(nums), []
+    for i in range(n - 2):
+        if nums[i] &gt; 0: break                       # 最小的都 &gt;0，后面不可能和为 0
+        if i &gt; 0 and nums[i] == nums[i-1]: continue # 去重 i
+        l, r = i + 1, n - 1
+        while l &lt; r:
+            s = nums[i] + nums[l] + nums[r]
+            if s &lt; 0: l += 1
+            elif s &gt; 0: r -= 1
+            else:
+                res.append([nums[i], nums[l], nums[r]])
+                l += 1; r -= 1
+                while l &lt; r and nums[l] == nums[l-1]: l += 1  # 去重 l
+                while l &lt; r and nums[r] == nums[r+1]: r -= 1  # 去重 r
+    return res
+</code></pre>
+<p>复杂度：O(n²)。</p>
+<h3 id="h3-3">3. 接雨水（双指针）</h3>
+<p><strong>题干</strong>：给柱子高度数组，计算下雨后能接多少水。</p>
+<p><strong>思路</strong>：对撞双指针维护左右两侧的最高柱子；<strong>谁矮动谁</strong>，答案 += 该侧最高 - 当前高度。核心：每个位置能接的水由 min(左最高, 右最高) 决定，矮的那侧就是天花板。</p>
+<pre><code class="language-python">def trap(height):
+    l, r = 0, len(height) - 1
+    lmax = rmax = ans = 0
+    while l &lt; r:
+        lmax = max(lmax, height[l]); rmax = max(rmax, height[r])
+        if lmax &lt; rmax:                       # 左边矮：左边是天花板，右边再高也没用
+            ans += lmax - height[l]; l += 1
+        else:
+            ans += rmax - height[r]; r -= 1
+    return ans
+</code></pre>
+<p>复杂度：O(n) / O(1)。</p>
+<h3 id="h3-4">4. 无重复字符的最长子串（滑动窗口）</h3>
+<p><strong>题干</strong>：求不含重复字符的最长子串长度。</p>
+<p><strong>思路</strong>：不定长滑动窗口，右指针逐个进，哈希表记每个字符<strong>最后出现的位置</strong>；遇到重复，左指针直接跳到 max(left, 上次位置+1)，不用一步步缩。</p>
+<pre><code class="language-python">def lengthOfLongestSubstring(s):
+    last = {}
+    left = ans = 0
+    for right, c in enumerate(s):
+        if c in last:
+            left = max(left, last[c] + 1)     # 直接跳，跳过整个重复区
+        last[c] = right
+        ans = max(ans, right - left + 1)
+    return ans
+</code></pre>
+<p>复杂度：O(n)。</p>
+<h3 id="h3-5">5. 最小覆盖子串（子串）</h3>
+<p><strong>题干</strong>：在 s 里找包含 t 所有字符的最短子串。</p>
+<p><strong>思路</strong>：滑动窗口 + 计数。need 记 t 的字符需求，valid 记已满足的字符种类数；右进满足后左缩更新最短。看到「最短子串包含……所有字符」就是这个模板。</p>
+<pre><code class="language-python">def minWindow(s, t):
+    from collections import Counter
+    need = Counter(t)
+    win = {}
+    valid = 0
+    left = 0
+    start, minlen = 0, float(&quot;inf&quot;)
+    for right, c in enumerate(s):
+        if c in need:
+            win[c] = win.get(c, 0) + 1
+            if win[c] == need[c]: valid += 1
+        while valid == len(need):             # 窗口已覆盖，尝试缩左
+            if right - left + 1 &lt; minlen:
+                start, minlen = left, right - left + 1
+            d = s[left]
+            if d in need:
+                if win[d] == need[d]: valid -= 1
+                win[d] -= 1
+            left += 1
+    return &quot;&quot; if minlen == float(&quot;inf&quot;) else s[start:start+minlen]
+</code></pre>
+<p>复杂度：O(n)。</p>
+<h3 id="h3-6">6. 旋转图像（矩阵）</h3>
+<p><strong>题干</strong>：n×n 矩阵顺时针旋转 90 度，原地修改。</p>
+<p><strong>思路</strong>：<strong>先转置（对角线交换），再每行反转</strong>。口诀：顺时针 = 转置 + 水平翻转；逆时针 = 转置 + 垂直翻转。</p>
+<pre><code class="language-python">def rotate(matrix):
+    n = len(matrix)
+    for i in range(n):
+        for j in range(i, n):                 # 转置：只动右上三角
+            matrix[i][j], matrix[j][i] = matrix[j][i], matrix[i][j]
+    for row in matrix:
+        row.reverse()                         # 每行反转
+</code></pre>
+<p>复杂度：O(n²) / O(1)。</p>
+<h3 id="h3-7">7. K 个一组翻转链表（链表）</h3>
+<p><strong>题干</strong>：每 k 个节点一组翻转，不足 k 个保持原序。</p>
+<p><strong>思路</strong>：哑节点 + 双指针定位每组（pre → head…tail → nxt）；先数 k 个，不够直接返回；翻转这一组再拼接。翻转头插法：把 cur 依次插到组前。</p>
+<pre><code class="language-python">def reverseKGroup(head, k):
+    dummy = ListNode(0, head)
+    pre = dummy
+    while head:
+        tail = pre
+        for _ in range(k):                    # 数够不够 k 个
+            tail = tail.next
+            if not tail: return dummy.next
+        nxt = tail.next                       # 保存组后节点
+        head, tail = reverse(head, tail)      # 翻转这一组
+        pre.next = head; tail.next = nxt      # 拼接
+        pre = tail; head = nxt
+    return dummy.next
+
+def reverse(head, tail):
+    prev, cur = tail.next, head               # prev 从组后节点开始
+    while prev != tail:
+        nxt = cur.next
+        cur.next = prev
+        prev, cur = cur, nxt
+    return tail, head
+</code></pre>
+<p>复杂度：O(n) / O(1)。</p>
+<h3 id="h3-8">8. LRU 缓存（链表 + 哈希）</h3>
+<p><strong>题干</strong>：实现 get / put；容量满时淘汰最久未使用的键。</p>
+<p><strong>思路</strong>：哈希表（键 → 节点）+ 双向链表（头部最新、尾部最旧）。命中就摘下来插到头；超容量删尾。看到「最近最少/最近使用」就是哈希 + 双链表。</p>
+<pre><code class="language-python">class Node:
+    def __init__(self, k=0, v=0, prev=None, nxt=None):
+        self.k, self.v, self.prev, self.nxt = k, v, prev, nxt
+
+class LRUCache:
+    def __init__(self, capacity):
+        self.cap = capacity
+        self.mp = {}
+        self.head, self.tail = Node(), Node()      # 哑头哑尾
+        self.head.nxt, self.tail.prev = self.tail, self.head
+
+    def _remove(self, node):                       # 摘除
+        node.prev.nxt, node.nxt.prev = node.nxt, node.prev
+
+    def _add(self, node):                          # 插到头部（最新）
+        node.nxt, node.prev = self.head.nxt, self.head
+        self.head.nxt.prev = node
+        self.head.nxt = node
+
+    def get(self, key):
+        if key not in self.mp: return -1
+        node = self.mp[key]
+        self._remove(node); self._add(node)        # 移到头 = 变最新
+        return node.v
+
+    def put(self, key, value):
+        if key in self.mp:
+            self._remove(self.mp[key])
+        node = Node(key, value)
+        self._add(node); self.mp[key] = node
+        if len(self.mp) &gt; self.cap:                # 淘汰最旧（尾部）
+            old = self.tail.prev
+            self._remove(old)
+            del self.mp[old.k]
+</code></pre>
+<p>复杂度：get / put 均 O(1)。</p>
+<h3 id="h3-9">9. 二叉树的右视图（二叉树）</h3>
+<p><strong>题干</strong>：从右侧看二叉树，返回每层最右边的节点。</p>
+<p><strong>思路</strong>：层序遍历（BFS 队列），每层最后一个进答案。备选：DFS 先右后左，每层第一个访问到的进答案。</p>
+<pre><code class="language-python">def rightSideView(root):
+    if not root: return []
+    from collections import deque
+    q, res = deque([root]), []
+    while q:
+        res.append(q[-1].val)                  # 每层最后一个
+        for _ in range(len(q)):
+            node = q.popleft()
+            if node.left: q.append(node.left)
+            if node.right: q.append(node.right)
+    return res
+</code></pre>
+<p>复杂度：O(n)。</p>
+<h3 id="h3-10">10. 岛屿数量（图论）</h3>
+<p><strong>题干</strong>：1 是陆地、0 是水，上下左右连通的陆地算一个岛，数岛数。</p>
+<p><strong>思路</strong>：DFS 沉岛——遇到 1 就计数 +1，然后把它和整片连通的 1 都改成 0（代替 visited 数组）。</p>
+<pre><code class="language-python">def numIslands(grid):
+    m, n = len(grid), len(grid[0])
+    def dfs(i, j):
+        if i &lt; 0 or i &gt;= m or j &lt; 0 or j &gt;= n or grid[i][j] == &quot;0&quot;: return
+        grid[i][j] = &quot;0&quot;                      # 沉岛
+        dfs(i+1, j); dfs(i-1, j); dfs(i, j+1); dfs(i, j-1)
+    cnt = 0
+    for i in range(m):
+        for j in range(n):
+            if grid[i][j] == &quot;1&quot;:
+                cnt += 1
+                dfs(i, j)
+    return cnt
+</code></pre>
+<p>复杂度：O(mn)。</p>
+<h3 id="h3-11">11. 括号生成（回溯）</h3>
+<p><strong>题干</strong>：生成 n 对括号的所有合法组合。</p>
+<p><strong>思路</strong>：回溯 + 剪枝。open &lt; n 才能加左括号；close &lt; open 才能加右括号；长度到 2n 收答案。看到「所有组合/排列」就是回溯。</p>
+<pre><code class="language-python">def generateParenthesis(n):
+    res = []
+    def dfs(o, c, path):
+        if len(path) == 2*n:
+            res.append(&quot;&quot;.join(path)); return
+        if o &lt; n:                             # 还能加左
+            path.append(&quot;(&quot;); dfs(o+1, c, path); path.pop()
+        if c &lt; o:                             # 右括号不能比左括号多
+            path.append(&quot;)&quot;); dfs(o, c+1, path); path.pop()
+    dfs(0, 0, [])
+    return res
+</code></pre>
+<p>复杂度：O(C(2n, n))。</p>
+<h3 id="h3-12">12. 有效的括号（栈）</h3>
+<p><strong>题干</strong>：判断括号串是否合法。</p>
+<p><strong>思路</strong>：栈。左括号入栈；右括号看栈顶是否匹配、不匹配或栈空就 false；最后栈必须空。看到「括号/配对/最近的先处理」就是栈。</p>
+<pre><code class="language-python">def isValid(s):
+    mp = {&quot;)&quot;: &quot;(&quot;, &quot;]&quot;: &quot;[&quot;, &quot;}&quot;: &quot;{&quot;}
+    st = []
+    for c in s:
+        if c in &quot;([{&quot;: st.append(c)
+        elif not st or st.pop() != mp[c]: return False
+    return not st
+</code></pre>
+<p>复杂度：O(n)。</p>
+<h3 id="h3-13">13. 数组中第 K 个最大元素（堆）</h3>
+<p><strong>题干</strong>：返回数组中第 k 大的元素。</p>
+<p><strong>思路</strong>：最小堆只留 k 个最大的，堆顶就是第 k 大。看到「第 K 大/小」先想堆。（快速选择 O(n) 平均，面试提一句即可，手撕背堆写法。）</p>
+<pre><code class="language-python">def findKthLargest(nums, k):
+    import heapq
+    h = []
+    for x in nums:
+        heapq.heappush(h, x)
+        if len(h) &gt; k: heapq.heappop(h)       # 弹出最小的，只留 k 个最大
+    return h[0]
+</code></pre>
+<p>复杂度：O(n log k)。</p>
+<h3 id="h3-14">14. 跳跃游戏（贪心）</h3>
+<p><strong>题干</strong>：数组每格表示从该位置最多能跳多远，问能否到达终点。</p>
+<p><strong>思路</strong>：贪心维护最远可达 farthest；i 超过 farthest 就是到不了；farthest ≥ n-1 就成了。看到「能不能到/最少几步到」先想贪心。</p>
+<pre><code class="language-python">def canJump(nums):
+    far = 0
+    for i, x in enumerate(nums):
+        if i &gt; far: return False              # 当前位置根本走不到
+        far = max(far, i + x)
+        if far &gt;= len(nums) - 1: return True
+    return False
+</code></pre>
+<p>复杂度：O(n)。</p>
+<h3 id="h3-15">15-18. 买卖股票的最佳时机 1 / 2 / 3 / 4（贪心 + 状态机 DP）</h3>
+<p><strong>题干</strong>：① 最多 1 次交易的最大利润；② 不限次数；③ 最多 2 次；④ 最多 k 次。不能同时持多股（卖出后才能再买）。</p>
+<p><strong>思路</strong>：本质都是<strong>状态机 DP</strong>——每天两个状态「持有 / 不持有」互相递推。1 次和无限次可以贪心；2 次和 k 次用 buy / sell 滚动变量。</p>
+<pre><code class="language-python"># 121 · 最多 1 次：记历史最低价
+def maxProfit1(prices):
+    mn, ans = float(&quot;inf&quot;), 0
+    for p in prices:
+        mn = min(mn, p)
+        ans = max(ans, p - mn)               # 今天卖，赚 p - mn
+    return ans
+
+# 122 · 无限次：累加所有上升段（每次涨都赚）
+def maxProfit2(prices):
+    return sum(max(0, prices[i] - prices[i-1]) for i in range(1, len(prices)))
+
+# 123 · 最多 2 次：四个状态滚动
+def maxProfit3(prices):
+    buy1 = buy2 = float(&quot;inf&quot;)
+    sell1 = sell2 = 0
+    for p in prices:
+        buy1 = min(buy1, p)                  # 第一次买入的最低价
+        sell1 = max(sell1, p - buy1)         # 第一次卖出的最大利润
+        buy2 = min(buy2, p - sell1)          # 第二次买入的净成本（扣掉第一次利润）
+        sell2 = max(sell2, p - buy2)         # 第二次卖出的最大利润
+    return sell2
+
+# 188 · 最多 k 次：通用状态机
+def maxProfit4(k, prices):
+    n = len(prices)
+    if k &gt;= n // 2:                          # k 足够大 = 无限次，退化成 122
+        return sum(max(0, prices[i] - prices[i-1]) for i in range(1, n))
+    buy = [float(&quot;inf&quot;)] * (k + 1)
+    sell = [0] * (k + 1)
+    for p in prices:
+        for j in range(1, k + 1):
+            buy[j] = min(buy[j], p - sell[j-1])   # 第 j 次买入净成本
+            sell[j] = max(sell[j], p - buy[j])    # 第 j 次卖出利润
+    return sell[k]
+</code></pre>
+<p>复杂度：① O(n)；② O(n)；③ O(n)；④ O(nk)。</p>
+<h3 id="h3-16">19. 单词拆分（动态规划）</h3>
+<p><strong>题干</strong>：字符串 s 能否由字典 wordDict 中的词拼接而成（词可重复用）。</p>
+<p><strong>思路</strong>：dp[i] = s 前 i 个字符能否拆分；dp[i] = 存在 j 使 dp[j] 为真且 s[j:i] 在字典里。单词用哈希集查。</p>
+<pre><code class="language-python">def wordBreak(s, wordDict):
+    words = set(wordDict)
+    dp = [False] * (len(s) + 1)
+    dp[0] = True
+    for i in range(1, len(s) + 1):
+        for j in range(i):
+            if dp[j] and s[j:i] in words:
+                dp[i] = True; break
+    return dp[len(s)]
+</code></pre>
+<p>复杂度：O(n²)。</p>
+<h3 id="h3-17">20. 最长递增子序列（多维动态规划）</h3>
+<p><strong>题干</strong>：求严格递增子序列的最长长度。</p>
+<p><strong>思路</strong>：dp[i] = 以 i 结尾的最长递增子序列 = max(dp[j] + 1)，j &lt; i 且 nums[j] &lt; nums[i]。（nlogn 做法 = 贪心 + 二分，面试提一句即可。）</p>
+<pre><code class="language-python">def lengthOfLIS(nums):
+    dp = [1] * len(nums)
+    for i in range(len(nums)):
+        for j in range(i):
+            if nums[j] &lt; nums[i]:
+                dp[i] = max(dp[i], dp[j] + 1)
+    return max(dp)
+</code></pre>
+<p>复杂度：O(n²)。</p>
+<h3 id="h3-18">21. 最长公共子序列（多维动态规划）</h3>
+<p><strong>题干</strong>：两个字符串的最长公共子序列长度。</p>
+<p><strong>思路</strong>：看到「两个字符串」先想二维 DP 表格。dp[i][j] = a 前 i 个和 b 前 j 个的最长公共子序列；字符相等 = 左上 +1，不等 = max(上, 左)。</p>
+<pre><code class="language-python">def longestCommonSubsequence(a, b):
+    m, n = len(a), len(b)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if a[i-1] == b[j-1]:
+                dp[i][j] = dp[i-1][j-1] + 1
+            else:
+                dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+    return dp[m][n]
+</code></pre>
+<p>复杂度：O(mn)。</p>
+<h3 id="h3-19">22. 最小路径和（多维动态规划）</h3>
+<p><strong>题干</strong>：网格从左上到右下，只能向右或向下，求最小路径和。</p>
+<p><strong>思路</strong>：dp[i][j] = grid[i][j] + min(上, 左)；第一行只能从左边来、第一列只能从上边来。直接原地改 grid 省空间。</p>
+<pre><code class="language-python">def minPathSum(grid):
+    m, n = len(grid), len(grid[0])
+    for i in range(m):
+        for j in range(n):
+            if i == 0 and j == 0: continue
+            if i == 0: grid[i][j] += grid[i][j-1]
+            elif j == 0: grid[i][j] += grid[i-1][j]
+            else: grid[i][j] += min(grid[i-1][j], grid[i][j-1])
+    return grid[m-1][n-1]
+</code></pre>
+<p>复杂度：O(mn)。</p>
+<h3 id="h3-20">23. 编辑距离（多维动态规划）</h3>
+<p><strong>题干</strong>：word1 变成 word2 的最少操作数（插入 / 删除 / 替换）。</p>
+<p><strong>思路</strong>：dp[i][j] = word1 前 i 个 → word2 前 j 个的最少操作数。相等 = 左上；不等 = min(左上, 上, 左) + 1（左上=替换、上=删除、左=插入）。第一行/列是空串的插入/删除次数。</p>
+<pre><code class="language-python">def minDistance(a, b):
+    m, n = len(a), len(b)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(m + 1): dp[i][0] = i      # 全删
+    for j in range(n + 1): dp[0][j] = j      # 全插
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if a[i-1] == b[j-1]:
+                dp[i][j] = dp[i-1][j-1]
+            else:
+                dp[i][j] = min(dp[i-1][j-1], dp[i-1][j], dp[i][j-1]) + 1
+    return dp[m][n]
+</code></pre>
+<p>复杂度：O(mn)。</p>
+<h3 id="h3-21">定位口诀（看到题眼 → 什么算法）</h3>
+<table>
+<thead>
+<tr>
+<th>题眼</th>
+<th>算法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>连续子串 / 子数组</td>
+<td>滑动窗口</td>
+</tr>
+<tr>
+<td>排序 + 固定一个 / 两数和</td>
+<td>对撞双指针</td>
+</tr>
+<tr>
+<td>两个字符串比较</td>
+<td>二维 DP</td>
+</tr>
+<tr>
+<td>矩阵原地旋转</td>
+<td>转置 + 反转</td>
+</tr>
+<tr>
+<td>分组 / 去重 / 计数</td>
+<td>哈希表</td>
+</tr>
+<tr>
+<td>最近使用 / 最少使用</td>
+<td>哈希 + 双向链表（LRU）</td>
+</tr>
+<tr>
+<td>括号匹配 / 配对</td>
+<td>栈</td>
+</tr>
+<tr>
+<td>第 K 大 / 第 K 小</td>
+<td>堆</td>
+</tr>
+<tr>
+<td>能不能到 / 最少几步到</td>
+<td>贪心</td>
+</tr>
+<tr>
+<td>所有组合 / 所有排列</td>
+<td>回溯</td>
+</tr>
+<tr>
+<td>网格连通块</td>
+<td>DFS / BFS 染色</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="sec-2">二、多头注意力（MHA）讲解 + 手写</h2>
+<p><strong>讲解</strong>（先背公式，再背三个角色）：</p>
+<ul>
+<li>公式：Attention(Q, K, V) = softmax(QKᵀ / √d_k) V</li>
+<li>三步：① Q 和每个 K 点积，算相关性分数；② softmax 把分数归一化成权重；③ 权重加权求和 V。</li>
+<li>三个矩阵的角色：Q = 查询（我在找什么）、K = 键（我身上有什么标签）、V = 值（实际内容）。Q·K 决定「谁和谁相关」，V 决定「相关内容传什么」。</li>
+<li>多头：把 d 维切成 h 份，每个头在自己的子空间算注意力，最后拼接再过 Wo 投影。为什么多头：不同头学不同关系（语法、指代、语义）。</li>
+<li>复杂度：n²·d（序列长 n 的平方级）——这就是长上下文贵的原因。</li>
+</ul>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import math
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, h, dmodel):
+        super().__init__()
+        self.h = h
+        self.dmodel = dmodel
+        self.d_k = dmodel // h                  # 每个头的维度
+        self.w_q = nn.Linear(dmodel, dmodel, bias=False)   # 四个投影（大模型惯例不带偏置）
+        self.w_k = nn.Linear(dmodel, dmodel, bias=False)
+        self.w_v = nn.Linear(dmodel, dmodel, bias=False)
+        self.w_o = nn.Linear(dmodel, dmodel, bias=False)
+
+    def forward(self, x, mask=None):
+        b, s = x.size(0), x.size(1)
+        q, k, v = self.w_q(x), self.w_k(x), self.w_v(x)     # (b, s, d)
+        # 切分多头：(b, s, d) → (b, s, h, d_k) → (b, h, s, d_k)
+        q = q.view(b, s, self.h, self.d_k).transpose(1, 2)
+        k = k.view(b, s, self.h, self.d_k).transpose(1, 2)
+        v = v.view(b, s, self.h, self.d_k).transpose(1, 2)
+        score = q @ k.transpose(-1, -2) / math.sqrt(self.d_k)  # QKᵀ/√d_k → (b, h, s, s)
+        if mask is not None:
+            score = score.masked_fill(mask == 0, -1e9)          # 屏蔽位置概率≈0
+        score = torch.softmax(score, dim=-1)
+        score = score @ v                                        # (b, h, s, d_k)
+        # 拼接：(b, h, s, d_k) → (b, s, d)
+        score = score.transpose(1, 2).contiguous().view(b, s, self.dmodel)
+        return self.w_o(score)
+
+# 测试：padding mask（末尾两个位置是 padding，屏蔽掉）
+x = torch.randn(2, 10, 512)
+mask = torch.ones(2, 1, 1, 10)      # (batch, 1, 1, seq) 广播到 (batch, h, seq, seq)
+mask[:, :, :, -2:] = 0
+mha = MultiHeadAttention(h=8, dmodel=512)
+output = mha(x, mask=mask)           # 输出形状 (2, 10, 512)
+</code></pre>
+<p><strong>口述四要点</strong>：</p>
+<ol>
+<li><strong>为什么除 √d_k</strong>：Q 和 K 每个元素是独立随机变量，点积的方差 = d_k；除以 √d_k 让方差归一为 1，softmax 梯度不饱和（否则大值区域梯度接近 0）。</li>
+<li><strong>softmax 为什么减 max</strong>：数值稳定——指数不溢出，且结果不变（分子分母同除 e^max）。</li>
+<li><strong>causal mask</strong>：生成时只能看过去——把 scores 的未来位置设成 -inf，softmax 后概率为 0。</li>
+<li><strong>为什么多头</strong>：不同子空间捕捉不同关系，拼接后信息更丰富。</li>
+</ol>
+<hr />
+<h2 id="sec-3">三、GRPO loss 讲解 + 手写</h2>
+<p><strong>讲解</strong>（先背组内优势，再背和 PPO 的区别）：</p>
+<ul>
+<li>全称：组相对策略优化（Group Relative Policy Optimization）。同一道题生成一组 n 个答案，组内互相比好坏，不需要价值模型（critic）。</li>
+<li>组内优势：A = (r − 组内均值) / 组内标准差——同题一组答案互相比，减均值天然是基线、除标准差控制尺度。</li>
+<li>损失：loss = −( min(ρ·A, clip(ρ)·A) − β·KL )。ρ = 概率比 = exp(新 logp − 旧 logp)。</li>
+<li>clip 的作用：限制更新幅度，防策略一次走太远（涨别涨过界、跌别跌过头）。</li>
+<li>KL 惩罚：把学生拉回参考模型，防偏离太远；k1 / k3 是两种 KL 估计（k3 非负更稳）。</li>
+<li>和 PPO 的核心区别：PPO 用价值模型估计优势（多一个模型、多一半显存），GRPO 用「同题一组答案互相比」代替——这就是省显存的原因，我的两个项目都在用。</li>
+</ul>
+<pre><code class="language-python">import sys
+import math
+
+def grpo_loss(logprobs, rewards, group_size, eps=0.2, beta=0.001, ref_logprobs=None, kl_type=&quot;k1&quot;):
+    # logprobs / rewards: 一维列表，每 group_size 个是同一道题的组
+    # 说明：速记版把 logprobs 当「新-旧 log 差」处理，即 rho = exp(logprobs)。
+    #       实际训练里 rho = exp(logp_new - logp_old)，手撕时写清楚即可。
+    n = len(logprobs)
+    assert n % group_size == 0
+    total = 0.0
+    for g in range(0, n, group_size):
+        r = rewards[g:g + group_size]
+        mean_r = sum(r) / group_size
+        std_r = (sum((x - mean_r) ** 2 for x in r) / group_size) ** 0.5 + 1e-9
+        A = [(x - mean_r) / std_r for x in r]        # 组内相对优势（GRPO 核心）
+        for j in range(group_size):
+            rho = math.exp(logprobs[g + j])          # 概率比
+            # PPO 式 clip：min(ρ·A, clip(ρ)·A)
+            clipped = min(rho, 1 + eps) if A[j] &gt;= 0 else max(rho, 1 - eps)
+            surr = min(rho * A[j], clipped * A[j])
+            # KL 惩罚（与参考模型）
+            kl = 0.0
+            if ref_logprobs is not None:
+                diff = logprobs[g + j] - ref_logprobs[g + j]   # 当前减参考（新减旧）
+                if kl_type == &quot;k1&quot;:                       # k1：平方近似（有偏，最常用）
+                    kl = 0.5 * diff ** 2
+                elif kl_type == &quot;k3&quot;:                     # k3：无偏且恒非负
+                    kl = diff - 1 + math.exp(-diff)
+            total += -(surr - beta * kl)                 # 负号 = 最大化变最小化
+    return total / n
+
+def main():
+    # 输入格式：第一行 n group_size eps beta；第二行 n 个 logprobs；第三行 n 个 rewards
+    # （可选第四行 n 个 ref_logprobs，没有则 KL=0）
+    data = sys.stdin.read().split()
+    if not data: return
+    n, gs = int(data[0]), int(data[1])
+    eps, beta = float(data[2]), float(data[3])
+    idx = 4
+    logprobs = [float(x) for x in data[idx:idx + n]]; idx += n
+    rewards = [float(x) for x in data[idx:idx + n]]; idx += n
+    ref = [float(x) for x in data[idx:idx + n]] if len(data) - idx &gt;= n else None
+    print(f&quot;{grpo_loss(logprobs, rewards, gs, eps, beta, ref):.4f}&quot;)
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre>
+<p><strong>口述三要点</strong>：</p>
+<ol>
+<li><strong>GRPO 核心</strong>：组内归一化优势 A = (r − mean) / std——同一道题的 n 个答案互相比，不需要 critic。</li>
+<li><strong>clip 的作用</strong>：限制更新幅度防策略跑飞（min(ρA, clip(ρ)A) 取保守侧）。</li>
+<li><strong>KL 惩罚</strong>：拉回参考模型；diff = 当前减参考，k1 平方近似（有偏）、k3 = diff − 1 + e^(−diff) 无偏且恒非负。</li>
+</ol>
+<hr />
+<h2 id="sec-4">四、交叉熵损失 讲解 + 手写</h2>
+<p><strong>讲解</strong>：</p>
+<ul>
+<li>公式：CE = −Σ y_i · log p_i。y 是真实分布（分类任务里是 one-hot），p 是模型预测概率。</li>
+<li>one-hot 下简化：CE = −log p_正确类——模型对正确类的概率越高，损失越小。</li>
+<li>两个等价关系：最小化交叉熵 = 最大化对数似然（与最大似然估计等价）；CE = H(y) + KL(y ∥ p)，真值 one-hot 时 H(y) = 0，所以 CE = KL(y ∥ p)——交叉熵就是「预测分布和真实分布的差距」。</li>
+<li>数值稳定：先减 max 再 exp，或者用 log_softmax（log 和 softmax 合并算，防下溢）。</li>
+<li>PyTorch 注意：CrossEntropyLoss 内部已包含 softmax，输入要传 logits（未归一化的分数），不能先自己 softmax。</li>
+<li>黄金梯度：softmax + 交叉熵对 logits 的梯度 = p − y（预测概率 − 真实 one-hot），形式极简，面试手推必考。</li>
+</ul>
+<pre><code class="language-python">import sys
+import math
+
+def cross_entropy(logits, y):
+    # logits: [C] 未归一化分数；y: 真实类别下标（0 ~ C-1）
+    mx = max(logits)
+    ex = [math.exp(v - mx) for v in logits]      # 数值稳定：减 max
+    s = sum(ex)
+    log_p = math.log(ex[y]) - math.log(s)        # log_softmax 正确类
+    return -log_p
+
+def main():
+    # 输入格式：第一行 C；第二行 C 个 logits；第三行真实类别下标 y
+    data = sys.stdin.read().split()
+    if not data: return
+    C = int(data[0])
+    logits = [float(x) for x in data[1:1 + C]]
+    y = int(data[1 + C])
+    print(f&quot;{cross_entropy(logits, y):.4f}&quot;)
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre>
+<p><strong>口述四要点</strong>：</p>
+<ol>
+<li>交叉熵 = −Σ y·log p，one-hot 下就是 −log p_正确类。</li>
+<li>最小化交叉熵 = 最大化对数似然；且 CE = H(y) + KL(y ∥ p)，one-hot 时就是 KL 散度。</li>
+<li>softmax 前减 max / 用 log_softmax 防下溢；PyTorch 的 CrossEntropyLoss 内部已含 softmax，输入传 logits。</li>
+<li>softmax + 交叉熵的梯度 = p − y（预测概率减真实标签），这是反向传播里最简洁的梯度形式。</li>
+</ol>
+<hr />
+<h2 id="sec-5">五、Flash Attention 讲解（口述题）</h2>
+<p><strong>讲解</strong>：</p>
+<ul>
+<li>问题：标准注意力要把 n×n 的注意力分数矩阵完整写进显存（HBM）再读回来做 softmax——显存 O(n²)，瓶颈在显存带宽（IO）而不是算力，序列一长就爆。</li>
+<li>核心思想：分块（tiling）——把 Q 按行切成块，每块和全部 K、V 算局部注意力；softmax 不用一次算完，用「在线 softmax」边算边修正（维护 running max 和修正系数，新块来了按比例缩放旧结果）。</li>
+<li>关键性质：全程不把 n×n 矩阵写回显存，显存降到 O(n)，而且结果和标准注意力<strong>数学上完全相等</strong>——不是近似算法，只是换了计算顺序。</li>
+<li>效果：训练和推理提速 2-4 倍，同样的显存能跑更长的序列。配套的 FlashDecoding 用来并行化解码阶段的注意力。</li>
+</ul>
+<p><strong>口述三要点</strong>：</p>
+<ol>
+<li>标准注意力的瓶颈是显存带宽——n×n 矩阵要来回读写 HBM。</li>
+<li>FlashAttention 分块 + 在线 softmax，显存从 O(n²) 降到 O(n)。</li>
+<li>结果精确相等（不是近似），只是换了计算顺序。</li>
+</ol>
+<h2 id="sec-6">六、KL 散度 讲解 + 手写</h2>
+<p><strong>讲解</strong>：</p>
+<ul>
+<li>公式：KL(P ∥ Q) = Σ P(x) · log(P(x)/Q(x))——衡量两个分布的距离，<strong>不对称</strong>：KL(P∥Q) ≠ KL(Q∥P)。</li>
+<li>前向 KL(P真实 ∥ Q学生) = 覆盖式（mean-seeking）：真实分布高的地方学生都必须高——宁可多沾、不能漏。</li>
+<li>后向 KL(Q学生 ∥ P老师) = 主模式式（mode-seeking）：学生只追老师主峰；学生敢在老师不看好的地方说话，惩罚爆炸——宁可少说、不能乱说。</li>
+<li>与交叉熵的关系：CE(P, Q) = H(P) + KL(P ∥ Q)；one-hot 真值下 H(P) = 0，所以分类里最小化交叉熵 = 最小化 KL 散度。</li>
+<li>我的项目里：在线策略蒸馏用逐词的后向 KL 散度（veRL 低方差 KL）；组相对策略优化里当惩罚项拉回参考模型；k1 / k3 是它的两种估计。</li>
+</ul>
+<pre><code class="language-python">import math
+
+def kl_divergence(p, q):
+    # p, q: 两个等长分布（概率之和为 1）
+    return sum(p[i] * math.log(p[i] / q[i]) for i in range(len(p)) if p[i] &gt; 0)
+</code></pre>
+<p><strong>口述三要点</strong>：</p>
+<ol>
+<li>不对称，方向决定行为——前向是覆盖式（宁滥勿缺），后向是主模式式（宁缺勿滥）。</li>
+<li>CE = H(P) + KL(P ∥ Q)，one-hot 下 CE 就是 KL。</li>
+<li>蒸馏选后向 KL（追老师主峰、不发散到长尾噪声）；组相对策略优化用它当惩罚拉回参考模型。</li>
+</ol>
+<h2 id="sec-7">七、KV cache 讲解（口述题）</h2>
+<p><strong>讲解</strong>：</p>
+<ul>
+<li>自回归生成：第 t 步只生成一个新 token，但要和前面所有 token 算注意力。没有缓存：每步重算全部历史，总计算量 O(n³)。有缓存：把每层算过的 K、V 存下来，新 token 只和历史的 K、V 算注意力，总计算量降到 O(n²)。</li>
+<li>显存开销：2 × 层数 × 序列长 × 维度 × 精度字节（K 和 V 各一份）——长序列、大并发时 KV cache 是显存大头。</li>
+<li>优化方向：KV 量化（8bit / 4bit）、PagedAttention（vLLM 把 KV 分页管理、防显存碎片）、MLA（DeepSeek 把 KV 低秩压缩再存）、窗口或淘汰策略。</li>
+<li>和我项目的联系：vLLM 项目里「请求准入要预留整条序列的显存」，预留的就是 KV cache——显存紧张时长请求占满 KV 空间，才堵住短请求，我做的配对调度治的就是这个。</li>
+</ul>
+<p><strong>口述三要点</strong>：</p>
+<ol>
+<li>省的是重复计算：总计算量 O(n³) → O(n²)，用显存换时间。</li>
+<li>两个阶段：预填充算力密集（一次算完整个提示词）、解码显存带宽密集（每步读全部 KV cache）。</li>
+<li>优化三板斧：量化、分页（PagedAttention）、低秩压缩（MLA）。</li>
+</ol>
+<h2 id="sec-8">八、RoPE 旋转位置编码 讲解 + 手写</h2>
+<p><strong>讲解</strong>：</p>
+<ul>
+<li>公式：把 q、k 向量按维度两两分组，每组乘一个 2×2 旋转矩阵，旋转角 = 位置 × θ_j，θ_j = base^(−2j/d)，base 默认 10000。</li>
+<li>神奇性质：位置 m 的 q 和位置 n 的 k 点积 = q·R_{n−m}·k——<strong>只依赖相对位置 n−m</strong>，天然是相对位置编码。</li>
+<li>频率分布：靠前的维度 θ 大、转得快（精细区分近距离位置）；靠后的维度 θ 小、转得慢（粗略编码远距离）。</li>
+<li>长文本外推：序列超训练长度时位置角超出训练范围，调大 base（NTK-aware 缩放）可以改善外推。</li>
+</ul>
+<pre><code class="language-python">import math
+
+def rope(q, pos, base=10000.0):
+    # q: [d]（d 为偶数），返回按位置 pos 旋转后的向量
+    d = len(q)
+    out = q[:]
+    for j in range(d // 2):
+        theta = base ** (-2 * j / d)         # 第 j 对的旋转频率
+        c, s = math.cos(pos * theta), math.sin(pos * theta)
+        x, y = q[2*j], q[2*j+1]
+        out[2*j], out[2*j+1] = x * c - y * s, x * s + y * c
+    return out
+</code></pre>
+<p><strong>口述三要点</strong>：</p>
+<ol>
+<li>旋转矩阵乘 q/k，角度和位置成正比。</li>
+<li>点积只依赖相对位置——两个向量转的角度差就是位置差。</li>
+<li>维度越低频率越高；长文本外推靠调大 base。</li>
+</ol>
+<h2 id="sec-9">九、LoRA &amp; QLoRA 讲解 + 手写</h2>
+<p><strong>讲解</strong>：</p>
+<ul>
+<li>LoRA（低秩适配）：冻结原权重 W，只训练两个小矩阵 B、A：W' = W + (α/r)·B·A。r 很小（8-64），可训练参数只有千分之一量级。原理：微调对权重的改动是低秩的，少数几个方向就够表达大部分改动。</li>
+<li>QLoRA（量化低秩适配）三件套：基座用 4 比特 NF4 量化存储（前向时反量化回来算）；双重量化（量化用的缩放系数再量化一次）；分页优化器（显存不够时优化器状态换页到内存）。效果：单卡 24G 就能微调几十 B 的模型。</li>
+<li>我的项目实配：两个项目的监督微调都用 QLoRA——搜索项目秩 32、缩放 64、4 比特，训出的增量权重只有 82MB，最后合并回基座；强化学习阶段上全参数（要冲上限，低秩容量会成为瓶颈）。一句话：「监督微调省钱、强化学习上全参」。</li>
+<li>为什么效果接近全参：量化的只是「存储」的权重，训练时反量化回来算、计算精度够；低秩增量给了足够的调整自由度。</li>
+</ul>
+<pre><code class="language-python"># LoRA 前向：y = Wx + (α/r)·B·A·x，只有 A、B 参与训练
+def lora_forward(x, W, A, B, alpha, r):
+    base = W @ x                              # 冻结部分
+    delta = (alpha / r) * (B @ (A @ x))       # A: [r, in]，B: [out, r]
+    return base + delta
+</code></pre>
+<p><strong>口述三要点</strong>：</p>
+<ol>
+<li>冻结 W 只训 B·A，参数量千分之一；α/r 控制增量强度。</li>
+<li>QLoRA = 4 比特 NF4 存基座 + 双重量化 + 分页优化器。</li>
+<li>我的监督微调用 QLoRA（秩 32 / 缩放 64 / 82MB），强化学习上全参；量化的是存储不是计算，效果接近全参。</li>
+</ol>
+<hr />
+<h2 id="sec-10">十、最后 5 分钟检查清单</h2>
+<ul>
+<li>[ ] 23 道题过一遍定位口诀，标出自己还没写过的（K 个一组 / LRU / 最小覆盖 / 编辑距离优先看代码）</li>
+<li>[ ] 股票四问的 buy/sell 状态机推演一遍（k 次是通用版）</li>
+<li>[ ] MHA 口述四要点能说（√d_k / 减 max / mask / 多头意义）</li>
+<li>[ ] GRPO 三要点能说（组内优势 / clip / KL）</li>
+<li>[ ] 交叉熵四要点能说（公式 / 等价 MLE 与 KL / 数值稳定 / 梯度 p−y）</li>
+<li>[ ] Flash Attention 三要点能说（显存带宽瓶颈 / 分块+在线 softmax / 结果精确相等）</li>
+<li>[ ] KL 散度三要点能说（不对称 / 前向覆盖式后向主模式式 / CE = H + KL）</li>
+<li>[ ] KV cache 三要点能说（O(n³)→O(n²) / 两阶段 / 量化分页低秩）</li>
+<li>[ ] RoPE 三要点能说（旋转矩阵 / 相对位置 / 频率与 base）</li>
+<li>[ ] LoRA/QLoRA 三要点能说（冻结只训 BA / 4bit 三件套 / SFT 省钱 RL 全参）</li>
+<li>[ ] 保底三板斧 + 三句救场话术</li>
+</ul>
+<!-- dsh-site-enhancer:js -->
+<script src="assets/site.js"></script>
+</body></html>

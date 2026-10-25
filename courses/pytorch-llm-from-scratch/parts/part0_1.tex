@@ -1,0 +1,383 @@
+﻿\section{Part 0 — 课程导览与目标}
+
+这是一门「用纯 PyTorch 从零构建完整大语言模型」的实战课程。它的定位不是再讲一遍 Transformer 论文，也不是教人调 API，而是把现代 LLM 的\textbf{完整生命周期}拆成可运行的代码：从最底层的注意力机制开始，一路走到预训练、监督微调、奖励建模与 RLHF。讲师在开场就把课程目标说得很直接——学完这门课，你不仅知道怎么「用」一个模型，还会理解让 GPT 这类模型真正工作的每一个核心构件，并且亲手实现它们。
+
+\subsection{为什么要有这门课：从「会用」到「会建」}
+
+市面上关于 LLM 的教程大致分两类：一类教你用现成模型（提示词、API、应用编排），另一类展示别人是怎么构建的。讲师点名感谢了 Sebastian Raschka 等人的公开教程，认为它们是自己理解 LLM 原理的灵感来源；但本课程想做一件这些教程没有集中做的事：\textbf{在一个地方、用一套连续的代码，把现代 LLM 的端到端工作原理完整展示出来}。
+
+这种「端到端」有两层含义。第一是\textbf{横跨整条流水线}：预训练、SFT、对齐（奖励模型 + RLHF）都在课程里实现。第二是\textbf{纵跨抽象层级}：从「注意力矩阵长什么样」到「怎样在笔记本上把一个玩具模型训起来」，中间没有断点。为此课程在理论深度上刻意克制——用讲师的话说，\textbf{只使用推进到实操所必需的最小理论量}（``the minimum necessary force''），把大部分篇幅留给代码与调试。
+
+\subsection{课程目标：把 LLM 的完整生命周期走一遍}
+
+讲师把 GPT 助手的训练流程概括为四个阶段，这四个阶段构成了整门课的主线：
+
+\begin{enumerate}
+\item \textbf{预训练（pretraining）}：把互联网规模的数据处理成数万亿 token，用成千上万块 GPU 训练数月，得到一个「基座模型」（base model）。这是最贵的一步，也是本课程 Part 2--Part 5 的主题。
+\item \textbf{监督微调（SFT, supervised fine-tuning）}：用相对少量的指令—回答数据，把「只会预测下一个词」的基座模型变成「会按指令作答」的助手。对应 Part 6。
+\item \textbf{对齐（alignment）}：让模型不输出有偏见、不安全或不符合人类偏好的内容。课程把它拆成两步：先训练奖励模型（Part 7），再用 RLHF 优化策略（Part 8）。
+\item \textbf{部署与推理}：课程在 Part 4 讨论规模扩展、混合精度、检查点与日志，为「真的跑起来」补上工程细节。
+\end{enumerate}
+
+\begin{importantbox}{这门课要交付的能力}
+学完并跟着敲完代码后，你应该能够：(1) 从零写出可训练的 decoder-only Transformer；(2) 在单机 CPU/GPU 上训练一个字符级小模型并采样；(3) 把原生 Transformer 现代化（RMSNorm、RoPE、SwiGLU、KV cache 等，Part 3）；(4) 完成 SFT、奖励模型与 PPO-RLHF 的最小闭环；(5) 理解 MoE 这类大模型扩展技术的基本机制。
+\end{importantbox}
+
+\subsection{学习路线与代码结构}
+
+课程共 9 个部分（Part 0 是导览，Part 1--Part 8 是 8 个技术模块），每部分对应仓库里的一个目录：
+
+\begin{center}
+\begin{tabular}{@{}p{1.2cm}p{5.4cm}p{7.6cm}@{}}
+\toprule
+部分 & 主题 & 主要内容 \\
+\midrule
+Part 1 & 核心 Transformer 架构 & 位置编码、self-attention、单头/多头注意力、FFN、残差 + LayerNorm、Transformer block \\
+Part 2 & 训练一个微型 LLM & 字节级分词、数据集与批次、交叉熵损失、训练循环、温度/top-k/top-p 采样、验证集评估 \\
+Part 3 & 现代化架构 & RMSNorm、RoPE、SwiGLU、滑动窗口注意力、KV cache、滚动缓冲 \\
+Part 4 & 扩大规模 & 梯度累积、混合精度（AMP）、检查点、日志、学习率调度 \\
+Part 5 & 混合专家模型（MoE） & 路由与门控、负载均衡、稳定性技巧、稠密与 MoE 混合块 \\
+Part 6 & 监督微调 & 指令数据集、prompt/response 格式化、掩码、SFT 评估 \\
+Part 7 & 奖励建模 & 成对偏好数据、Bradley--Terry 损失、排序损失 \\
+Part 8 & RLHF（PPO） & 价值头、rollout、奖励与 KL 惩罚、GAE、PPO 裁剪目标 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+仓库的代码组织有一个统一约定，值得先记住：\textbf{每个部分都有自己的 \texttt{orchestrator.py} 作为入口}。它把该部分的演示、测试与可视化按顺序串起来，你从入口往下读，就能依次进入各个模块。Part 1 的目录里，模块与课程小节的对应关系是：
+
+\begin{itemize}
+\item \texttt{pos\_encoding.py}：位置编码（绝对可学习 + 正弦两种）；
+\item \texttt{attn\_numpy\_demo.py}：用 NumPy 和极小数字手算一遍 self-attention；
+\item \texttt{single\_head.py}：单头自注意力的 PyTorch 实现；
+\item \texttt{multi\_head.py}：多头自注意力（带 shape tracing）；
+\item \texttt{ffn.py}：前馈网络（GELU，隐层宽度 $4\times d_{\text{model}}$）；
+\item \texttt{block.py}：残差 + LayerNorm 组成的 Transformer block；
+\item \texttt{attn\_mask.py}：因果掩码工具；\texttt{vis\_utils.py}/\texttt{demo\_*.py}：可视化与形状演示；\texttt{tests/}：单元测试。
+\end{itemize}
+
+\subsection{环境与前置要求}
+
+环境要求被刻意压到最低：\textbf{一台装了 Python 和 PyTorch 的笔记本}即可；如果有 GPU 可以装 CUDA，但课程里的所有内容都被设计成\textbf{在 CPU 上也能跑}，只是会慢一点。仓库根目录提供 \texttt{requirements.txt}，Part 1 的依赖基本只有 PyTorch、NumPy 与 matplotlib（用于画注意力热图）。
+
+课程不假设你有分布式训练或编译器背景，但在读 Part 1 之前，最好对「矩阵乘法、softmax、线性层」有直觉——如果没有，讲师建议先在 NumPy 里把注意力公式手推一遍（Part 1 正好提供了这样的 NumPy demo）。
+
+\subsection{本章小结}
+\begin{itemize}
+\item 课程定位：用一套连续的纯 PyTorch 代码，端到端展示现代 LLM 的完整生命周期，理论只保留推进实操所必需的部分。
+\item 主线四阶段：预训练 $\rightarrow$ SFT $\rightarrow$ 对齐（奖励模型 + RLHF）$\rightarrow$ 部署/推理；8 个 Part 与之对应。
+\item 代码约定：每个部分以 \texttt{orchestrator.py} 为入口，模块与小节一一对应；Part 1 的文件名就是最好的目录。
+\item 环境：笔记本 + Python + PyTorch 即可，CPU 可跑；GPU 可选。
+\end{itemize}
+
+\section{Part 1 — 核心 Transformer 架构}
+
+Part 1 是整个课程的地基：把 2017 年论文《Attention Is All You Need》里的原生 Transformer，用代码一个组件一个组件地实现出来。讲师的处理方式很工程化——先给你一张「Transformer 在整个训练流水线里处于什么位置」的全景图，然后按数据流动的顺序逐个实现：位置编码 $\rightarrow$ self-attention $\rightarrow$ 单头 $\rightarrow$ 多头 $\rightarrow$ 因果掩码 $\rightarrow$ 前馈网络 $\rightarrow$ 残差与 LayerNorm $\rightarrow$ 堆叠成 block。最后你会得到一个可以前向传播的 GPT 模型，为 Part 2 的训练做好准备。
+
+\subsection{先把镜头拉远：GPT 训练流程与 Transformer 的位置}
+
+讲师先回到 Part 0 提到的四阶段流水线，指出\textbf{我们今天只关心第一步里最核心的那块}：原生 Transformer。它来自 2017 年的论文，原本是编码器—解码器结构；但现代 LLM 几乎都是\textbf{decoder-only}（只用解码器），所以课程只实现解码器一侧。
+
+一次前向传播的数据流可以写成下面的顺序，后面每一小节都会对应其中一段：
+
+\begin{enumerate}
+\item 文本先被\textbf{分词}（tokenization），每个 token 变成一个整数 ID；
+\item ID 进入\textbf{词嵌入}（token embedding），得到 $(B,T,d_{\text{model}})$ 的张量；
+\item 加上\textbf{位置编码}（positional encoding），注入顺序信息；
+\item 通过一个线性层得到 \textbf{Q、K、V} 三份拷贝，再做\textbf{缩放点积注意力}；
+\item decoder-only 架构在 softmax 之前加\textbf{因果掩码}（causal mask），让每个位置只能看到自己和左边；
+\item 注意力输出与输入做\textbf{残差相加}，再过 \textbf{LayerNorm}；
+\item 进入\textbf{前馈网络}（FFN），同样残差 + LayerNorm；
+\item 以上构成一个 \textbf{Transformer block}，堆叠 $N$ 层；
+\item 最后接一个线性头得到词表大小的 logits，softmax 后就是下一个 token 的概率分布。
+\end{enumerate}
+
+\begin{importantbox}{一句话抓住 Transformer}
+Transformer block $=$「多头自注意力 + 前馈网络」，每个子层都包在「残差连接 + LayerNorm」里；把它堆 $N$ 次，再接一个线性分类头，就是 GPT 的主干。Part 1 剩下的内容，就是把这句话里的每个名词变成可运行的代码。
+\end{importantbox}
+
+\subsection{位置编码：为什么需要、正弦公式怎么来的}
+
+\subsubsection{问题：注意力本身没有顺序感}
+
+Self-attention 的计算是「每个 token 与所有 token 做加权求和」，它\textbf{对输入顺序是置换不变（permutation-invariant）的}：把句子里的词打乱，注意力算出来的结果只是跟着换位置，模型本身不会「知道」谁在前谁在后。而语言的意义高度依赖顺序（``The cat sat on the mat'' 与 ``The mat sat on the cat'' 完全不同）。因此必须显式地把位置信息注入到输入里。
+
+课程实现了两种经典的\textbf{绝对位置编码}（absolute positional encoding）：
+
+\begin{enumerate}
+\item \textbf{可学习位置编码}（learned）：给每个位置 $0,1,\dots,T-1$ 分配一个可训练向量，直接加到词嵌入上；
+\item \textbf{正弦位置编码}（sinusoidal）：用不同频率的正弦/余弦函数解析地生成位置向量，不参与训练——这是 2017 年原论文采用的方法，也是 Part 1 的重点。
+\end{enumerate}
+
+\subsubsection{正弦公式}
+
+设位置为 $\text{pos}$、维度下标为 $i$、模型维度为 $d_{\text{model}}$，原论文的编码是：
+
+$$
+PE_{(\text{pos},\,2i)} = \sin\!\left(\frac{\text{pos}}{10000^{2i/d_{\text{model}}}}\right), \qquad
+PE_{(\text{pos},\,2i+1)} = \cos\!\left(\frac{\text{pos}}{10000^{2i/d_{\text{model}}}}\right).
+$$
+
+其中：
+
+\begin{itemize}
+\item $\text{pos}$：token 在序列中的位置（$0$ 到 $T-1$）；
+\item $i$：维度下标；偶数维用 $\sin$，奇数维用 $\cos$；
+\item $10000^{2i/d_{\text{model}}}$：频率分母。$i$ 越大，分母越大、频率越低，于是不同维度覆盖了从高频到低频的一组「波长」；
+\item 输出 $PE\in\mathbb{R}^{T\times d_{\text{model}}}$，与词嵌入逐元素相加。
+\end{itemize}
+
+为什么用这种设计？论文给出的直觉是：对任意固定偏移 $k$，$PE_{\text{pos}+k}$ 可以表示成 $PE_{\text{pos}}$ 的线性函数，因此模型容易学会「相对位置」；而且它不依赖训练长度，理论上可以外推到比训练更长的序列（是否真的外推得好是另一个问题，Part 3 会给出更好的答案 RoPE）。
+
+\subsubsection{实现细节：register\_buffer 与奇偶维填充}
+
+代码里有两个容易忽略但很重要的细节。第一，正弦编码是\textbf{固定常数}，所以用 \texttt{register\_buffer} 注册而不是 \texttt{nn.Parameter}——它会跟随模型搬到 GPU、被保存进 state dict，但\textbf{不产生梯度}。第二，先算 $\text{div\_term}=\exp(-i\cdot\log(10000)/d_{\text{model}})$，再用「$\sin(\text{pos}\cdot\text{div\_term})$ 填偶数列、$\cos$ 填奇数列」的方式一次性构造完整个矩阵，这比逐位置循环快得多。
+
+\subsection{Self-attention 的手算：一个小例子}
+
+在写模块之前，讲师先用一个「极小数字」的 NumPy demo 把注意力公式手算一遍，让读者对形状和数值都有直觉。例子刻意缩小：批大小 $B=1$、序列长度 $T=3$、模型维度 $d_{\text{model}}=4$，即输入 $X$ 是 $1\times3\times4$。
+
+\subsubsection{四步计算}
+
+\begin{enumerate}
+\item \textbf{投影出 Q、K、V}：$Q=XW_Q,\ K=XW_K,\ V=XW_V$。这里 $W_Q,W_K,W_V$ 是三个线性层（形状 $d_{\text{model}}\times d_k$），把每个 token 的 4 维表示映射到 $d_k$ 维；
+\item \textbf{算注意力分数}：$\text{scores}=QK^{\top}$，形状变成 $T\times T$——第 $i$ 行第 $j$ 列表示「第 $i$ 个 token 对第 $j$ 个 token 的关注原始分数」；
+\item \textbf{缩放 + softmax}：$\text{weights}=\mathrm{softmax}\left(\frac{QK^{\top}}{\sqrt{d_k}}\right)$，每行归一化成概率；
+\item \textbf{加权求和}：$\text{output}=\text{weights}\cdot V$，形状 $(T,d_k)$，每个位置得到「按注意力权重混合后的值向量」。
+\end{enumerate}
+
+用公式写出来就是：
+
+$$
+\mathrm{Attention}(Q,K,V)=\mathrm{softmax}\!\left(\frac{QK^{\top}}{\sqrt{d_k}}\right)V .
+$$
+
+其中 $Q,K,V$ 分别由输入经三个线性变换得到，$d_k$ 是每个头的维度，$\sqrt{d_k}$ 是缩放因子。
+
+\subsubsection{为什么必须除以 $\sqrt{d_k}$}
+
+点积的结果随维度增长而变大：若 $q,k$ 的各分量独立、均值 0、方差 1，则 $q\cdot k$ 的方差约为 $d_k$。维度一大，分数就会很大，softmax 随之饱和（几乎 one-hot），梯度接近于零，训练会变慢甚至停滞。除以 $\sqrt{d_k}$ 相当于把分数的方差拉回 1 左右，让 softmax 工作在梯度敏感的区间。这个细节在 demo 里也会被打印出来，因为它是注意力实现里最常被漏掉的一步。
+
+\subsection{单头注意力：把公式变成 nn.Module}
+
+有了手算直觉，就可以把它封装成 PyTorch 模块。\texttt{single\_head.py} 中的单头自注意力类只做一件事：把一个 $(B,T,d_{\text{model}})$ 的输入映射成 $(B,T,d_k)$ 的注意力输出，并返回注意力权重。
+
+实现上有三个要点：
+
+\begin{itemize}
+\item \textbf{三个独立线性层}：$W_Q,W_K,W_V$ 分别是 \texttt{nn.Linear(d\_model, d\_k, bias=False)}；这与多头里「一次性投影再拆分」的做法不同，单头写法更直观；
+\item \textbf{因果掩码}：在 softmax 之前调用 \texttt{causal\_mask(T)}，把上三角（未来位置）填成 $-\infty$；
+\item \textbf{形状}：$Q,K,V$ 均为 $(B,T,d_k)$，$\text{scores}$ 为 $(B,T,T)$，weights 为 $(B,T,T)$，输出为 $(B,T,d_k)$。
+\end{itemize}
+
+\begin{lstlisting}[caption={单头自注意力的核心前向（节选自 \texttt{part\_1/single\_head.py}）}]
+def forward(self, x):            # x: (B, T, d_model)
+    B, T, _ = x.shape
+    q, k, v = self.q(x), self.k(x), self.v(x)   # each (B,T,d_k)
+    scale = 1.0 / math.sqrt(q.size(-1))
+    attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+    mask = causal_mask(T, device=x.device)
+    attn = attn.masked_fill(mask.squeeze(1), float('-inf'))
+    w = F.softmax(attn, dim=-1)
+    out = torch.matmul(w, v)                     # (B,T,d_k)
+    return out, w
+\end{lstlisting}
+
+这段代码与上一节的手算一一对应，唯一的新东西是掩码（下一小节展开）。讲师还给它写了单元测试：用固定随机种子构造输入，把「NumPy 手算的权重」与「PyTorch 模块算出的权重」逐元素比较，确保两边在数值上一致——这一步对后面复用注意力模块很重要。
+
+\subsection{多头注意力：拆分、并行、拼接、投影}
+
+单头注意力的表达能力有限：它只有一套 $Q/K/V$ 投影、只能学到一种「关注模式」。多头注意力（multi-head attention, MHA）的思路是\textbf{把 $d_{\text{model}}$ 维拆成 $h$ 个 $d_{\text{head}}$ 维的子空间}，每个头独立做一次注意力，最后把结果拼接、再投影回 $d_{\text{model}}$。这样模型可以同时学习「关注相邻词」「关注句法依存」「关注远距离指代」等不同的关系。
+
+\subsubsection{形状的完整旅程（本节最该记住的东西）}
+
+课程用一组具体数字把形状走了一遍：$B=1$、$T=5$、$d_{\text{model}}=12$、$h=3$，于是 $d_{\text{head}}=12/3=4$。前向传播中每个张量的形状是：
+
+\begin{center}
+\begin{tabular}{@{}p{4.0cm}p{3.2cm}p{6.8cm}@{}}
+\toprule
+阶段 & 形状 & 说明 \\
+\midrule
+输入 $x$ & $(1,5,12)$ & $(B,T,d_{\text{model}})$ \\
+\texttt{qkv = self.qkv(x)} & $(1,5,36)$ & 一次线性层得到 $3d_{\text{model}}$ \\
+\texttt{view}(B,T,3,h,d\_h) & $(1,5,3,3,4)$ & 把 36 拆成 $3\times3\times4$ \\
+\texttt{unbind(dim=2)} & 3 个 $(1,5,3,4)$ & 得到独立的 $q,k,v$ \\
+\texttt{transpose(1,2)} & $(1,3,5,4)$ & 头维提到前面，变成 $(B,h,T,d_h)$ \\
+$q k^{\top}/\sqrt{d_h}$ & $(1,3,5,5)$ & 每个头一张 $T\times T$ 分数矩阵 \\
+softmax & $(1,3,5,5)$ & 每行归一化 \\
+$\text{weights}\cdot v$ & $(1,3,5,4)$ & 上下文 $(B,h,T,d_h)$ \\
+\texttt{transpose + contiguous + view} & $(1,5,12)$ & 拼接所有头，回到 $d_{\text{model}}$ \\
+\texttt{self.proj} & $(1,5,12)$ & 输出投影 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection{两个实现技巧}
+
+第一，\textbf{用一个线性层一次算出 QKV}。与其写三个 \texttt{Linear}，不如写一个输出维度为 $3d_{\text{model}}$ 的 \texttt{Linear}，再在最后一维拆成三份。课件里也强调：从数学上看两者完全等价，但一次大矩阵乘法在 GPU 上更高效。
+
+第二，\textbf{\texttt{transpose} 之后必须 \texttt{contiguous} 才能 \texttt{view}}。\texttt{transpose} 只改变张量的步长（stride），底层内存并不连续；而 \texttt{view} 要求内存连续，否则会报错。所以拼接所有头时，写法分成三步：先 \texttt{transpose(1,2)} 把头维换到中间，再 \texttt{contiguous()} 让内存连续，最后 \texttt{view(B,T,C)} 合并头。讲师顺带对比了 \texttt{reshape}：它会返回一份新数据的副本，也能达到目的，但会多一次内存分配。
+
+\begin{lstlisting}[caption={多头自注意力的核心前向（节选自 \texttt{part\_1/multi\_head.py}）}]
+def forward(self, x):                       # (B,T,d_model)
+    B, T, C = x.shape
+    qkv = self.qkv(x)                       # (B,T,3*C)
+    qkv = qkv.view(B, T, 3, self.n_head, self.d_head)
+    q, k, v = qkv.unbind(dim=2)             # each (B,T,heads,dim)
+    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    scale = 1.0 / math.sqrt(self.d_head)
+    attn = torch.matmul(q, k.transpose(-2, -1)) * scale   # (B,h,T,T)
+    mask = causal_mask(T, device=x.device)
+    attn = attn.masked_fill(mask, float('-inf'))
+    w = F.softmax(attn, dim=-1)
+    ctx = torch.matmul(w, v)                                # (B,h,T,d_h)
+    out = ctx.transpose(1, 2).contiguous().view(B, T, C)
+    return self.proj(out), w
+\end{lstlisting}
+
+模块初始化处有一个很值得学的「护栏」：\texttt{assert d\_model \% n\_head == 0}，否则直接抛异常。如果不整除，$d_{\text{head}}$ 会出现小数，后面所有形状都会错；早点报错比在矩阵乘法里看到莫名其妙的形状错误要好得多。另一个工程细节是 \texttt{trace\_shapes} 开关：打开后每一步都打印张量形状，这正是理解 MHA 最快的方式。
+
+除形状追踪外，课程还提供了可视化脚本：运行 \texttt{python orchestrator.py --visualize} 会把每个注意力头的权重矩阵画成热图（图 \ref{f:p01_heads}）。热图的对角线及下方较亮、右上角全黑，正是因果掩码在起作用；同时也能直观看到不同头关注的位置不同——这就是「多头」相对单头的意义：同一个输入被投影到不同的子空间，各自学习一种关系。
+
+\subsection{因果掩码：让模型看不见未来}
+
+Decoder-only 模型的训练目标是「预测下一个 token」，所以在计算位置 $t$ 的表示时，模型\textbf{只能使用位置 $\le t$ 的信息}，不能偷看后面的 token——否则训练时是在抄答案，推理时根本没有未来信息，模型会崩。
+
+实现非常短：构造一个上三角的布尔矩阵，$\text{True}$ 表示「需要被遮住」：
+
+\begin{lstlisting}[caption={\texttt{part\_1/attn\_mask.py}：因果掩码}]
+import torch
+
+def causal_mask(T: int, device=None):
+    """True means masked (disallowed); shape (1,1,T,T) for broadcasting."""
+    m = torch.triu(torch.ones((T, T), dtype=torch.bool, device=device), diagonal=1)
+    return m.view(1, 1, T, T)
+\end{lstlisting}
+
+然后在 softmax 之前用 \texttt{masked\_fill(mask, -inf)} 把被遮住的位置设成负无穷。softmax 对 $-\infty$ 的输出是 0，于是这些位置的注意力权重精确地变成 0，等价于「完全看不见」。为什么用 $-\infty$ 而不是 0？因为若填 0，softmax 之后仍有非零权重；只有 $-\infty$ 才能让概率归零。
+
+讲师用一句 ``The cat sat on the mat'' 来解释掩码的语义：当模型处理到 ``sat'' 时，它能看见 ``The cat sat''（含自己），但看不见 ``on the mat''。把掩码可视化出来就是一张下三角矩阵：第 $i$ 行只有前 $i$ 列是有效的。课程还为掩码写了单元测试（\texttt{test\_causal\_mask.py}），检查「上三角被遮、下三角保留、对角线保留」这三个性质。
+
+\begin{warningbox}{最常见的实现错误：掩码方向}
+\texttt{torch.triu(..., diagonal=1)} 遮的是「右上角」（未来位置），保留的是左下角（过去与当前）。如果误写成 \texttt{diagonal=0} 或用了错误的方向，模型会连自己当前位置都看不到（或者看到未来），训练损失会以难以察觉的方式变坏。写完掩码后，务必打印出来肉眼确认一次。
+\end{warningbox}
+
+\subsection{前馈网络：4 倍扩张 + GELU}
+
+\begin{knowledgebox}{视频位置说明：FFN 与 block 在视频里的位置}
+Part 1 的视频在 00:39:30 左右收尾于「位置编码 + 注意力 + 可视化」，而 FFN、残差/LayerNorm 与 Transformer block 的代码讲解，出现在 Part 2 讲者走读 GPT 模型时（约 00:57--01:00）。本讲义按课程 README 的小节划分，把它们作为 Part 1 的收尾内容补全，这样读者能在一处看完整条架构。
+\end{knowledgebox}
+
+注意力负责「在 token 之间混合信息」，前馈网络（FFN）负责「对每个 token 单独做非线性变换」。它把每个位置的 $d_{\text{model}}$ 维向量映射到 $4d_{\text{model}}$ 维的隐藏空间，过激活函数，再映射回 $d_{\text{model}}$。这个「先扩张再压缩」的结构像一个小自编码器，给模型更大的容量去拟合复杂函数。
+
+\begin{lstlisting}[caption={\texttt{part\_1/ffn.py}：带 GELU 的前馈网络}]
+class FeedForward(nn.Module):
+    def __init__(self, d_model: int, mult: int = 4, dropout: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, mult * d_model),
+            nn.GELU(),
+            nn.Linear(mult * d_model, d_model),
+            nn.Dropout(dropout),
+        )
+    def forward(self, x):
+        return self.net(x)
+\end{lstlisting}
+
+两个设计点值得解释。第一是 \textbf{扩张倍数 \texttt{mult=4}}：GPT 系列常用 4 倍，这是容量与计算量之间的经验折中（Part 3 会看到现代模型如何用门控（SwiGLU）在相近参数量下改进这一块）。第二是 \textbf{GELU 而不是 ReLU}：ReLU 在 0 处有「硬拐点」，而 GELU 是一条平滑曲线，它对负值不是直接截断而是平滑地压小。讲师的说法是：平滑的激活函数通常带来更稳定的梯度与训练过程，这也是 GPT 系列一直用 GELU 的原因。
+
+\subsection{残差连接与 LayerNorm：让深网络能训练}
+
+到目前为止每个子层都是「一个会改变表示的函数」。如果直接把很多子层串联起来，深层网络会遇到梯度消失、训练不稳定等经典问题。Transformer block 用两个技巧解决它：
+
+\begin{enumerate}
+\item \textbf{残差连接}（residual / skip connection）：$x \leftarrow x + f(x)$。每个子层只学「增量」，原始信息有一条高速公路直接流过去，梯度可以无衰减地反传；
+\item \textbf{LayerNorm}：对每个 token 的 $d_{\text{model}}$ 维表示做归一化（减均值、除标准差，再乘可学习的缩放与偏移），稳定每层的数值尺度。
+\end{enumerate}
+
+具体归一化公式为：
+
+$$
+\mathrm{LN}(x)=\gamma\cdot\frac{x-\mu}{\sqrt{\sigma^2+\epsilon}}+\beta ,
+$$
+
+其中 $x$ 是某个 token 的 $d_{\text{model}}$ 维向量，$\mu,\sigma^2$ 是该向量各维的均值与方差，$\epsilon$ 是防止除零的小常数，$\gamma,\beta$ 是可学习的缩放与偏移参数。
+
+\subsubsection{Pre-norm：先归一化再进子层}
+
+把上面两个技巧组合成 block 时，有一个顺序选择：先归一化再进子层（pre-norm），还是先过子层再归一化（post-norm）。课程的实现是 pre-norm：
+
+\begin{lstlisting}[caption={\texttt{part\_1/block.py}：Transformer block（pre-norm + 残差）}]
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model, n_head, dropout=0.0):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = MultiHeadSelfAttention(d_model, n_head, dropout)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ffn = FeedForward(d_model, mult=4, dropout=dropout)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))[0]   # 注意力子层 + 残差
+        x = x + self.ffn(self.ln2(x))       # FFN 子层 + 残差
+        return x
+\end{lstlisting}
+
+注意代码里 \texttt{self.attn(...)[0]} 取的是元组第一个元素：MHA 的 \texttt{forward} 返回 \texttt{(out, weights)} 两项，这里只要输出，不要注意力权重（权重只用于可视化）。pre-norm 的好处是每个子层的输入都被归一化到稳定尺度，深堆叠时训练更稳；代价是最后需要再补一个 LayerNorm（见下节 GPT 的前向）。课程在这里顺带说明：Part 3 会把 LayerNorm 换成 RMSNorm，把「减均值」这一步去掉，这是现代 LLM 的标准做法。
+
+\begin{warningbox}{LayerNorm vs BatchNorm}
+LayerNorm 在\textbf{每个 token 自己的特征维}上归一化，因此与 batch 大小、序列长度都无关；BatchNorm 则在 batch 维上统计，遇到变长序列会非常别扭。语言模型几乎只用 LayerNorm（或其变体 RMSNorm），原因就在这里。
+\end{warningbox}
+
+\subsection{把一切堆起来：Transformer block 与 GPT}
+
+\subsubsection{从 block 到模型}
+
+把 TransformerBlock 重复 $N$ 次，再在最前面接「词嵌入 + 位置编码」、最后面接「LayerNorm + 线性头」，就得到一个可以训练的语言模型。Part 2 的 \texttt{model\_gpt.py} 正是这么写的（摘要）：
+
+\begin{lstlisting}[caption={GPT 主干的骨架（据 \texttt{part\_2/model\_gpt.py} 精简）}]
+self.tok_emb = nn.Embedding(vocab_size, n_embd)
+self.pos_emb = nn.Embedding(block_size, n_embd)
+self.drop    = nn.Dropout(dropout)
+self.blocks  = nn.ModuleList([Block(n_embd, n_head, dropout)
+                              for _ in range(n_layer)])
+self.ln_f    = nn.LayerNorm(n_embd)              # 最后的归一化
+self.head    = nn.Linear(n_embd, vocab_size, bias=False)
+
+def forward(self, idx, targets=None):
+    B, T = idx.shape
+    pos = torch.arange(0, T, device=idx.device).unsqueeze(0)
+    x = self.tok_emb(idx) + self.pos_emb(pos)    # 词嵌入 + 位置嵌入
+    x = self.drop(x)
+    for blk in self.blocks:                      # 堆叠 N 个 block
+        x = blk(x)
+    x = self.ln_f(x)
+    logits = self.head(x)                        # (B,T,vocab_size)
+    ...
+\end{lstlisting}
+
+这个骨架里有两个容易漏掉的点：\textbf{最后的 \texttt{ln\_f}}（pre-norm 结构需要它来归一化最后一层的输出）以及\textbf{权重初始化}（线性层与嵌入用均值 0、标准差 0.02 的正态分布，偏置置 0）。讲师提到，初始化虽然简单，但对小模型能否顺利收敛影响很大。
+
+另外，\texttt{model\_gpt.py} 里的 \texttt{CausalSelfAttention} 把 Part 1 手写的「masked\_fill + softmax」换成了 PyTorch 的 \texttt{F.scaled\_dot\_product\_attention(..., is\_causal=True)}：两者语义等价，但后者在 GPU 上会走 flash attention 一类的高效实现，这是工程代码里更常见的写法。
+
+\subsubsection{把 Part 1 的零件组装起来}
+
+到这里，Part 1 的每个零件都已经实现了。把它们串起来就是一次完整的前向传播：
+
+\begin{enumerate}
+\item 输入 token ID $\rightarrow$ 词嵌入（$B,T,d_{\text{model}}$）；
+\item 加位置编码（正弦或可学习）；
+\item 过 $N$ 个 Transformer block：每个 block 内是「LN $\rightarrow$ MHA $\rightarrow$ 残差 $\rightarrow$ LN $\rightarrow$ FFN $\rightarrow$ 残差」；
+\item 最后 LN $\rightarrow$ 线性头 $\rightarrow$ logits $\rightarrow$ softmax 得到下一个 token 的概率。
+\end{enumerate}
+
+Part 1 只做前向，不训模型；训练所需的损失、数据集、采样留到 Part 2。但讲师强调，理解 Part 1 的形状变化（尤其是 MHA 里 $(B,T,3d)\rightarrow(B,T,3,h,d_h)\rightarrow(B,h,T,d_h)$ 这一串）之后，后面所有部分都会变得可读——因为现代模型只是在同样的骨架上替换组件（RMSNorm、RoPE、SwiGLU、MoE）。
+
+\subsection{本章小结}
+\begin{itemize}
+\item 现代 LLM 是 decoder-only Transformer：token 化 $\rightarrow$ 词嵌入 $\rightarrow$ 位置编码 $\rightarrow$ 多头注意力（带因果掩码）$\rightarrow$ 残差 + LayerNorm $\rightarrow$ 前馈网络 $\rightarrow$ 堆叠 $N$ 层 $\rightarrow$ 线性头。
+\item 位置编码解决「注意力对顺序不敏感」的问题；正弦编码用不同频率的 sin/cos 生成固定向量，用 \texttt{register\_buffer} 注册、不参与训练。
+\item Self-attention 是 $\mathrm{softmax}(QK^{\top}/\sqrt{d_k})V$；除以 $\sqrt{d_k}$ 是为了防止点积过大让 softmax 饱和、梯度消失。
+\item 多头注意力把一个 $d_{\text{model}}$ 拆成 $h$ 个 $d_{\text{head}}$：一次线性层得到 $3d_{\text{model}}$，view 成 $(3,h,d_h)$ 再拆分，各头并行计算后 \texttt{concat}（需要 \texttt{contiguous} 才能 \texttt{view}）再投影。
+\item 因果掩码用上三角布尔矩阵 + $-\infty$ \texttt{masked\_fill} 实现「看不见未来」，保证训练目标与推理行为一致。
+\item FFN 是「$4\times$ 扩张 $\rightarrow$ GELU $\rightarrow$ 压缩」；block 用 pre-norm 残差结构（\texttt{x + sublayer(LN(x))}）保证深层可训练；堆叠后接最终 LayerNorm 与线性头即为 GPT。
+\end{itemize}

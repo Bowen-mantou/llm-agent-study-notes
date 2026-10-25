@@ -1,0 +1,298 @@
+% ============================================================
+% Part 4 — Scaling Up / Part 5 — Mixture-of-Experts
+% 本文件是讲义片段：不含 \documentclass，由主文件 \input 引入
+% 对应视频：BV1VJa869ECR（AIDeepCoder），Part 4 = 02:33:53–03:17:22，Part 5 = 03:17:22–03:44:19
+% ============================================================
+
+\section{Part 4 — 扩展规模}
+
+\subsection{本讲定位：从「跑通训练」到「生产级训练」}
+
+前两部分已经把 Transformer 的零件（Part 1）和一条能跑的迷你训练流水线（Part 2）、以及现代架构的若干改进（Part 3）写完了。Part 4 换了一个视角：不再往模型里加新零件，而是\textbf{把训练这件事做到生产级}。讲者的原话大意是：模型架构大家讨论得多，但真正盯着训练过程反复调试是很痛苦、也很少被系统讲的——这一部分补的正是这块。
+
+本讲围绕课程仓库 Part 4 里的 \texttt{train.py}（以及它调用的 \texttt{tokenizer\_bpe.py}、\texttt{dataset\_bpe.py}、\texttt{lr\_scheduler.py}、\texttt{amp\_accum.py}、\texttt{checkpointing.py}、\texttt{logger.py}）展开，覆盖五件事：\textbf{分词器从字节级升级到 BPE、梯度累积与混合精度、学习率计划与 warmup、检查点与断点续训、日志与可视化}。讲者在结尾把 Part 3、Part 4、Part 5 合在一起称为「构建生产级 LM 的核心内容」：架构现代化 + 训练稳定性与通信 + MoE 与稠密层的结合。
+
+\begin{knowledgebox}{这一讲不是 scaling law 推导}
+章节标题叫 \emph{Scaling Up}，但视频的实际内容是\textbf{训练工程}：分词器、数值精度、梯度累积、学习率调度、检查点、日志。讲者在本片段中没有展开 scaling law 的公式、也没有讲数据规模的标度实验；分布式/并行的内容在后面 Part 5 结尾被明确说明「不在本课程范围内」（见 Part 5 的图~\ref{fig:p5-scope}）。因此本节按视频实际内容组织。
+\end{knowledgebox}
+
+\subsection{train.py 的参数面：一次训练需要哪些「旋钮」}
+
+讲者从 \texttt{train.py} 的入口参数讲起。参数分成三组（图~\ref{fig:p4-args}）：
+
+\begin{itemize}
+\item \textbf{数据与模型}：数据路径、输出目录、是否使用 BPE、词表大小、\texttt{block\_size}、层数、注意力头数、嵌入维度、dropout；
+\item \textbf{优化与训练}：batch size、epochs、总步数、学习率、warmup 步数、是否使用混合精度（mixed precision）、\textbf{梯度累积步数}（\texttt{grad\_accum\_steps}）；
+\item \textbf{工程与运维}：日志间隔、是否用 TensorBoard、每隔多少步保存检查点、保留最近多少个检查点（\texttt{keep\_last\_k}）、设备（CPU/GPU）。
+\end{itemize}
+
+这些旋钮里，后面几节重点讲三个：\textbf{梯度累积}（显存换 batch）、\textbf{warmup-cosine 调度}（稳定性）、\textbf{检查点与恢复}（长训练的生命线）。分词器则是一个容易被忽略、但直接影响序列长度与训练效率的选择。
+
+\subsection{分词器升级：从字节级到 BPE}
+
+\subsubsection{为什么字节级不够}
+
+Part 2 的字节级分词器只有 256 个词表项：一个汉字通常在 UTF-8 下占 3 个字节，于是同一个句子会变成很长的 token 序列。序列变长意味着：同样的上下文窗口能装下的内容更少、注意力计算更多、每个 token 携带的语义更少。生产模型需要用更大的词表把常见字符组合「打包」成一个 token——这就是 \textbf{BPE（byte pair encoding，字节对编码）}。
+
+\subsubsection{BPE 的机制：反复合并最频繁的相邻对}
+
+讲者用一个小例子讲清 BPE：从一串字符出发，统计相邻字符对的出现频率，把最频繁的那一对合并成一个新符号。例如最频繁的对是 \texttt{AA}，就把 \texttt{AA} 记作 \texttt{Z}；词表因此从 4 个符号增加到 5 个，但表示同一串字符所需的 token 数减少了。继续迭代：每次选当前最频繁的对合并，直到达到\textbf{最小频率阈值}或\textbf{词表大小上限}为止。
+
+讲者特别强调两点工程实践：
+
+\begin{enumerate}
+\item \textbf{BPE 训练不是梯度训练}：它只是在语料上收集并合并统计量，没有前向/反向传播；
+\item \textbf{训练分词器的语料与训练 LM 的语料可以不同}：如果希望分词器理解代码缩进与语法细节，就用代码语料训练它；这样缩进、常见后缀会变成单个 token，而不是拆成许多字节。
+\end{enumerate}
+
+本课程用 \texttt{tokenizers} 库（Rust 实现，速度快）而不是手写 BPE：一是教学重点在训练而非分词器实现，二是生产环境也建议用成熟实现。初始词表取字节级的 256，再合并到 \texttt{vocab\_size=8000}；由于设置了最小频率阈值，实际词表可能略小于 8000（讲者展示的 \texttt{vocab.json} 里约有 7600 项）。特殊 token 至少要定义 \texttt{BOS}（序列开始）、\texttt{EOS}（序列结束）与 \texttt{PAD}（填充/未知）。
+
+\begin{lstlisting}[caption={BPE 分词器的训练与保存（据视频 \texttt{tokenizer\_bpe.py} 整理）：用 \texttt{BpeTrainer} 指定词表大小、最小频率与特殊 token，在文本文件迭代器上训练后保存。}]
+from tokenizers import Tokenizer, models, trainers, pre_tokenizers
+
+tok = Tokenizer(models.BPE())
+tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+trainer = trainers.BpeTrainer(
+    vocab_size=vocab_size,
+    min_frequency=min_frequency,
+    special_tokens=["<bos>", "<eos>", "<pad>"],
+)
+tok.train_from_iterator(iter_texts(data_path), trainer=trainer)
+tok.save(tokenizer_dir)          # 产出 vocab.json + merges.txt
+\end{lstlisting}
+
+讲者展示的 \texttt{merges.txt} 很直观：先是「空格 + 空格 → 双空格」这类合并，往后出现 \texttt{-CTION} 这类常见后缀被合并成一个 token。这说明 BPE 学到的不是「单词」，而是\textbf{统计上高效的字符组合}——它让 LM 用更少的 token 表示同样的内容。
+
+\subsection{数据加载与模型配置的重建}
+
+BPE 版本的 \texttt{dataset\_bpe.py} 与 Part 2 的字节级版本结构相同：把文本读入内存、用 BPE 编码、\texttt{get\_batch} 随机取窗口并做 label shift（$y$ 是 $x$ 右移一位的同一段文本）。讲者提醒：这里是教学用的小语料所以一次性读入内存，生产环境通常要流式/分片加载。
+
+这里有一个训练脚本里很关键的工程细节：\textbf{恢复训练时不能只保存权重}。因为恢复模型需要知道词表大小、层数、头数、嵌入维度等超参数，所以检查点里必须同时保存模型配置（config）与分词器；加载时还要检查「检查点的词表大小」与「当前分词器的词表大小」是否一致，不一致就报错，而不是带着错位的 embedding 继续训练。讲者用「如果没有 config，程序会报错，而不是去猜参数」来说明这一点。
+
+\subsection{学习率计划：warmup + 余弦衰减}
+
+训练开始就把学习率设到目标值是有风险的：参数是随机初始化的，早期梯度方向不稳定，大学习率容易把训练带偏。Warmup 的做法是\textbf{先用小学习率线性升温到基础学习率，再按余弦曲线衰减}（图~\ref{fig:p4-warmup}）。讲者的解释是：这样可以减少「基础学习率该设多少」的盲目猜测——不必一开始就赌一个正确值，而是让模型先稳定下来。
+
+用公式写出来（$t$ 为当前步，$T_w$ 为 warmup 步数，$T$ 为总步数，$\eta_0$ 为基础学习率）：
+
+$$
+\eta(t)=
+\begin{cases}
+\eta_0\cdot \dfrac{t}{T_w}, & t<T_w,\\[2mm]
+\dfrac{\eta_0}{2}\left[1+\cos\left(\pi\cdot\dfrac{t-T_w}{T-T_w}\right)\right], & t\ge T_w,
+\end{cases}
+$$
+
+其中 $\eta(t)$ 是第 $t$ 步使用的学习率，$\eta_0$ 是基础学习率（\texttt{args.lr}，视频示例量级为 $3\times10^{-4}$），$T_w$ 是 warmup 步数（取「用户指定值」与「总步数的 10\%」中较小者），$T$ 是总训练步数（取「命令行步数」与「epochs $\times$ 数据加载器长度」中较小者）。讲者用「$t/T_w$ 乘以基础学习率」演示了升温过程：前期学习率很小，随 warmup 步数增加而线性变大；之后余弦曲线让学习率平滑下降，保证后期收敛稳定。
+
+\subsection{混合精度与梯度累积}
+
+\subsubsection{混合精度：用更低的数值精度换吞吐}
+
+混合精度（mixed precision）的核心是：前向/反向用 fp16 或 bf16 计算，权重与优化器状态仍用 fp32 保存。它带来两个直接收益——显存更省、计算更快（很多 GPU 上低精度矩阵乘吞吐更高）。代价是数值范围变小，梯度可能\textbf{下溢}（underflow）成 0。
+
+PyTorch 的解法是 \texttt{GradScaler}：反向传播前把 loss 乘一个缩放因子（scale）放大梯度，更新前再除回去；如果检测到 inf/nan 就自动降低缩放因子。讲者的代码里用 \texttt{autocast} 包住前向，用 \texttt{scaler.scale(...).backward()} 反向，用 \texttt{scaler.step(...)} 与 \texttt{scaler.update()} 更新。
+
+\subsubsection{梯度累积：用显存换「等效大 batch」}
+
+梯度累积（gradient accumulation）解决的是「想要大 batch，但显存放不下」的问题。做法是把一个大 batch 拆成 $K$ 个 micro-batch，逐个前向/反向并把梯度累加，等累积满 $K$ 次再真正做一次 \texttt{optimizer.step()}。讲者的例子是：想要 batch size 128，但一次前向放不下，就把 \texttt{grad\_accum\_steps} 设为 4，让 4 个 micro-batch 的梯度累加后再统一更新。
+
+为了与「一次大 batch」等价，loss 需要除以累积步数 $K$：
+
+$$
+\mathcal{L}_{\text{accum}}=\frac{1}{K}\sum_{k=1}^{K}\mathcal{L}\big(x^{(k)},y^{(k)}\big),
+$$
+
+其中 $K$ 是累积步数，$\mathcal{L}(x^{(k)},y^{(k)})$ 是第 $k$ 个 micro-batch 的交叉熵损失。这样累加出来的梯度就是 $K$ 个 micro-batch 的\textbf{平均梯度}，与直接在该大 batch 上算梯度一致。讲者的实现里对应「loss 先除以累积步数，再做 backward」。
+
+讲者把这两个机制封装成一个 \texttt{AmpGrad} 类（见 \texttt{amp\_accum.py}），对外只暴露三个动作：反向、判断是否该更新、执行更新。这样训练循环本身保持干净。下面是根据画面整理的关键接口（内部实现细节以仓库为准）：
+
+\begin{lstlisting}[caption={混合精度 + 梯度累积的关键调用（据视频 \texttt{train.py} 画面整理）：autocast 前向、缩放后反向，按累积步数决定何时真正更新。}]
+amp = AmpGrad(optim, accum=args.grad_accum_steps, amp=args.mixed_precision)
+
+with torch.cuda.amp.autocast(enabled=amp.amp):
+    logits, loss, _ = model(xb, yb)
+amp.backward(loss)               # inside: scaler.scale(loss / accum).backward()
+
+if amp.should_step():
+    amp.step(); amp.zero_grad()  # scaler.step(optim); scaler.update(); zero_grad
+    lr = sched.step()
+step += 1
+\end{lstlisting}
+
+\begin{warningbox}{两个常见坑}
+(1) 忘了把 loss 除以累积步数，等效学习率会放大 $K$ 倍，训练容易发散；(2) 在累积过程中调用 \texttt{optimizer.step()} 或提前清零梯度，会把累加的信号冲掉。判断「是否该 step」的计数器要覆盖所有 micro-batch，而不是按外层 batch 计数。
+\end{warningbox}
+
+\subsection{检查点、原子保存与断点续训}
+
+\subsubsection{检查点里要存什么}
+
+一次长训练可能跑几小时到几天，中途崩溃是常态。检查点（checkpoint）除了模型权重，还要保存：优化器状态（Adam 的动量与二阶矩）、学习率调度器状态（当前步数）、混合精度 scaler 状态、以及模型配置与分词器信息。少存任何一项，恢复后的训练都不是原来那条曲线。
+
+讲者把保存实现成 \textbf{原子保存（atomic save）}：先写临时文件，写完后重命名到目标路径，避免「写到一半崩溃」留下损坏的检查点。同时用 \texttt{keep\_last\_k} 做\textbf{滚动保留}：每保存一次就删掉过旧的检查点，只留最近 $k$ 个（演示里 $k=2$，每 50 步保存一次；300 步训练里，150 步的检查点会被 250 步的挤掉，以此类推）。否则磁盘会被大量中间文件撑爆。
+
+\subsubsection{SIGINT/SIGTERM：按 Ctrl+C 也要保住当前进度}
+
+讲者展示了一个很实用的设计：注册信号处理器，把「收到 Ctrl+C / SIGTERM」变成一个\textbf{保存请求标志}，然后在训练循环里检查这个标志，一旦为真就保存当前步的检查点再退出（图~\ref{fig:p4-signal}）。这样停止训练不会丢掉最后几十步的进度。
+
+对应到代码（据画面整理）：
+
+\begin{lstlisting}[caption={信号处理与「保存当前步」：把 Ctrl+C 变成一次保存请求，而不是直接杀掉进程。}]
+save_requested = {"flag": False}
+def _on_term(sig, frame): save_requested["flag"] = True
+signal.signal(signal.SIGTERM, _on_term)
+signal.signal(signal.SIGINT,  _on_term)
+
+while step < args.steps:
+    for xb, yb in train_loader:
+        if step >= args.steps: break
+        if save_requested["flag"]:
+            atomic_save_all(model, optim, sched, amp, step, out_dir,
+                            tok_dir, args.keep_last_k, cfg_build)
+            print(f"[signal] Saved checkpoint at step {step} to {out_dir}. Exiting.")
+            return
+        ...
+\end{lstlisting}
+
+讲者现场演示了效果：训练到第 180 步时按 Ctrl+C，日志显示它在 180 步保存并退出；重新运行时提示「检测到已训练 180 步」，从 180 步继续，而不是退回上一个检查点（150 步）。\textbf{多保住 30 步}听起来不多，但在长训练里就是真金白银的算力。
+
+\subsection{日志与可观测性：训练到底健康不健康}
+
+训练不是「loss 降了就行」。讲者用 TensorBoard 记录了一组指标，构成一个最小的训练观测面板（图~\ref{fig:p4-tb}）：
+
+\begin{itemize}
+\item \textbf{loss 与学习率}：loss 在 warmup 后沿余弦计划平稳下降；
+\item \textbf{吞吐}：每秒处理的 token 数（tokens/sec），用来判断训练是否被数据/通信拖慢；
+\item \textbf{GPU 显存}：显存分配量，判断是否接近 OOM；
+\item \textbf{梯度与参数的整体 L2 范数}：讲者观察到两者随训练\textbf{逐渐减小}，意味着更新幅度收敛、训练更稳定；
+\item \textbf{文本采样}：每隔若干步真正生成一段文本，人工看质量是否随训练变好；
+\item \textbf{QKV 直方图}：观察注意力投影的数值分布是否稳定、方差是否收敛。
+\end{itemize}
+
+讲者还强调一个细节：\textbf{loss 曲线不能替代真实评测}。训练时模型只在记录过的数据分布上前进，部署/生成时历史由模型自己产生，会遇到训练没见过的状态；所以除了 loss，还要定期采样生成、看质量变化。
+
+\subsection{本章小结}
+\begin{enumerate}
+\item Part 4 名为 \emph{Scaling Up}，实际讲的是\textbf{生产级训练工程}：分词器、混合精度、梯度累积、学习率调度、检查点恢复、日志观测。
+\item 分词器从字节级升级到 BPE：BPE 通过反复合并最频繁的相邻对扩大词表（256 $\rightarrow$ 8000）、缩短序列；分词器语料可与 LM 训练语料不同，代码/多语言场景要专门覆盖。
+\item 混合精度用低精度前向/反向换吞吐与显存，用 \texttt{GradScaler} 防梯度下溢；梯度累积用 micro-batch 累加凑出等效大 batch，loss 必须除以累积步数。
+\item 学习率用 warmup + 余弦：先线性升温稳定训练，再平滑衰减；warmup 减少了对基础学习率的盲目猜测。
+\item 检查点要保存模型/优化器/调度器/scaler/配置；用原子保存防损坏、用 \texttt{keep\_last\_k} 滚动保留、用信号处理在 Ctrl+C 时保存当前步并精确断点续训。
+\item 可观测性是一等公民：loss/lr、吞吐、显存、梯度与参数的 L2 范数、QKV 直方图、样本文本采样，共同构成「训练是否健康」的判断依据。
+\end{enumerate}
+
+\section{Part 5 — Mixture-of-Experts}
+
+\subsection{本讲定位：把 FFN 也「现代化」}
+
+Part 3 现代化了注意力块（GQA、RoPE 等）；这一部分转向 Transformer block 内部的另一大块——\textbf{前馈网络（FFN / MLP）}。讲者的推进方式是「拆小、放大、只研究一个模块」：不训练完整 LM，而是把 MLP 部分单独拿出来，用一个小 demo（6 个 token、4 个专家、top-k=1）把混合专家（Mixture-of-Experts, MoE）的路由、门控与负载均衡跑通并打印出中间量。
+
+\subsection{核心思想：稀疏激活换参数容量}
+
+MoE 的结构可以这样理解：注意力块的输出不再直接送进一个 MLP，而是先经过一个\textbf{门控函数 / 路由器（router）}，它输出一个概率分布，决定把这个 token 送到哪些专家（expert）去处理；每个专家本身就是一个 MLP。被选中的专家处理完再组合起来继续往前传。
+
+这么做的收益是双重的：
+
+\begin{itemize}
+\item \textbf{参数更多}：专家数 $E$ 个，模型总参数量随之增加，容量更大；
+\item \textbf{计算更省}：每个 token 只激活 top-$k$ 个专家，而不是把全部 $E$ 个专家都算一遍——稀疏激活意味着\textbf{同样的推理算力下可以有更多参数}，吞吐更高。
+\end{itemize}
+
+讲者的直觉解释是：可以让一个专家擅长编程、另一个擅长语言……但\textbf{哪个专家处理哪类 token 不是人指定的，而是训练过程自己学出来的}。多层堆叠后，模型「看起来参数很多」，但推理时只激活一小部分。
+
+\begin{knowledgebox}{MoE 的参数量与激活量}
+若单个专家参数量为 $P_e$、专家数为 $E$、每 token 激活 $k$ 个专家，则每个 token 实际参与的专家参数约为 $k\cdot P_e$，而模型\textbf{总}专家参数为 $E\cdot P_e$。MoE 的卖点正是「总参数 $E\cdot P_e$ 很大、单 token 计算量只有 $k\cdot P_e$」——用存储换计算效率。若与稠密 FFN 混合，还要加上稠密分支的参数与计算。
+\end{knowledgebox}
+
+\subsection{参考实现：Switch Transformer 的简化版}
+
+实现遵循 Switch Transformer 这篇早期 MoE 工作（图~\ref{fig:p5-paper}、图~\ref{fig:p5-toc}）。论文的目录本身就说明了 MoE 的几个关键主题：稀疏路由（simplifying / efficient sparse routing）、scaling 性质、以及数据/模型/专家并行。本讲只取其中\textbf{路由、门控与负载均衡}的最小实现；论文里的并行训练部分不在本课程实现范围内（见本节末尾图~\ref{fig:p5-scope}）。
+
+\subsection{组件一：专家 MLP}
+
+每个专家就是一个普通的 MLP，结构与 Part 3 的 FFN 相同：\texttt{Linear} 升维、\texttt{SiLU}/\texttt{SwiGLU} 激活、\texttt{Linear} 降维，可选 dropout。讲者的配置是「乘数 4」：输入维度 128 时，隐藏层为 $128\times4=512$。四个专家就是四个这样的 MLP；它们结构相同、参数独立。
+
+\subsection{组件二：Top-K 门控（gating）}
+
+门控函数本身非常轻量：一个从 $d_{model}$ 到专家数 $E$ 的线性层，输出 logits，softmax 成概率，再用 \texttt{torch.topk} 取前 $k$ 个专家。讲者的实现把「路由」与「负载均衡的统计量」放在同一个 \texttt{TopKGate} 里（图~\ref{fig:p5-gate}）。
+
+关键代码（据画面整理，保留原变量名）：
+
+\begin{lstlisting}[caption={Top-K 门控与负载均衡辅助损失（据视频 \texttt{gating.py} 整理）：概率矩阵按 token 求专家维均值得到 importance，按 top-1 硬分配统计 load，二者相乘求和再乘专家数得到 aux loss。}]
+class TopKGate(nn.Module):
+    def __init__(self, dim, n_expert, k=1):
+        super().__init__()
+        assert k >= 1 and k <= n_expert
+        self.n_expert, self.k = n_expert, k
+        self.w_g = nn.Linear(dim, n_expert, bias=True)
+
+    def forward(self, x):                       # x: (S, C)
+        logits = self.w_g(x)                    # (S, E)
+        probs = torch.softmax(logits, dim=-1)   # (S, E)
+        topk_vals, topk_idx = torch.topk(probs, k=self.k, dim=-1)
+        S, E = probs.size(0), probs.size(1)
+        importance = probs.mean(dim=0)          # (E,) 每个专家的平均被选概率
+        hard1 = topk_idx[:, 0]                  # (S,) top-1 硬分配
+        load = torch.zeros(E, device=x.device)
+        load.scatter_add_(0, hard1, torch.ones_like(hard1, dtype=load.dtype))
+        load = load / max(S, 1)                 # (E,) 每个专家分到的 token 比例
+        aux_loss = (E * (importance * load).sum())
+        return topk_idx, topk_vals, aux_loss
+\end{lstlisting}
+
+\subsection{组件三：MoE 层的前向（token 展平与按专家填回）}
+
+MoE 层前向的工程要点是\textbf{维度的展平与还原}。输入形状是 $(B,T,C)$（batch、序列长度、通道），但路由是按 token 独立决策的，所以先把 $B\times T$ 压成一维 token 流，得到 $(S,C)$（$S=B\cdot T$），送进门控；再按门控给出的索引，把每个 token 分给对应专家处理；最后把结果 reshape 回 $(B,T,C)$。
+
+讲者特意把 6 个 token 的输入\textbf{拆成两个 micro-batch} 再拼接，模拟真实训练中「一个 batch 的序列在展平后如何合并成一条 token 流」：展平后每一行是一个 token，每一列是一个专家的概率；按 top-k 选出专家后，用 scatter 类操作把激活填回对应专家的输出张量。
+
+\subsection{负载均衡：为什么需要辅助损失}
+
+\subsubsection{问题：专家「名人化」}
+
+如果放任路由器自由学习，会出现讲者所说的「名人问题」（celebrity problem）：大多数 token 都挤到少数几个专家，其他专家几乎不被使用、也学不到东西。这既浪费参数容量，也让训练不稳定（专家的梯度分布极不均衡）。所以需要显式的\textbf{负载均衡损失}（load-balancing loss）来惩罚不平衡的路由。
+
+\subsubsection{机制：importance × load 的辅助损失}
+
+Switch Transformer 的辅助损失由两个统计量构成：
+
+$$
+\mathcal{L}_{\text{aux}} = E\cdot\sum_{i=1}^{E} f_i\cdot P_i,
+$$
+
+其中 $E$ 是专家数，$P_i$ 是专家 $i$ 的 \textbf{importance}——在该 batch 的所有 token 上，门控给专家 $i$ 的平均概率；$f_i$ 是专家 $i$ 的 \textbf{load}——被 \textbf{top-1 硬分配}到专家 $i$ 的 token 比例。直观理解：$P_i$ 反映路由器「想让」专家 $i$ 处理多少，$f_i$ 反映它「实际」处理了多少；两者越不平衡，乘积项越倾向于惩罚集中。$\mathcal{L}_{\text{aux}}$ 与语言模型的交叉熵损失相加后一起反向传播。
+
+这个 demo 的数字很好地把机制讲清楚：4 个专家的 load 计数是 $[1,2,2,1]$，说明路由没有塌到单一专家；importance 四者接近（约 0.24--0.27），说明概率分布相对分散；由此算出的 $\mathcal{L}_{\text{aux}}\approx1.0034$，是一个「接近平衡」的示例。讲者还手算了一个更不平衡的例子（$\mathcal{L}_{\text{aux}}\approx1.3034$）来展示：路由越集中，辅助损失越大。
+
+\begin{warningbox}{辅助损失不是越小越好}
+$\mathcal{L}_{\text{aux}}$ 的作用是\textbf{约束路由别塌缩}，而不是训练目标本身。训练时它按一个系数加到总损失上；系数过大可能牺牲主任务效果（强迫均匀路由），过小则起不到均衡作用。本讲演示了 loss 的计算与量级，但没有展开系数调参——实际训练中它通常需要与主损失一起权衡。
+\end{warningbox}
+
+\subsection{与稠密层混合：hybrid 架构}
+
+讲者最后介绍了「MoE + 稠密 FFN」的混合做法：把 MoE 的输出与一个普通稠密 FFN 的输出加权融合，
+
+$$
+y = \alpha\cdot \mathrm{MoE}(x) + (1-\alpha)\cdot \mathrm{DenseFFN}(x),
+$$
+
+其中 $\alpha\in[0,1]$ 控制两者比重，视频里的默认值取 $0.5$（等权）。这样可以在「保留稠密层稳定行为」与「引入专家容量」之间平滑过渡：从纯稠密（$\alpha=0$）到纯 MoE（$\alpha=1$）可以渐变，而不是一刀切替换。讲者提到这种混合是「把 MoE 与稠密层结合以构建混合架构」的一种简单方式。
+
+\subsection{范围说明：分布式与训练-推理差异不在本讲}
+
+Part 5 的 README 提纲里列了「训练稳定性与分布式环境下的通信开销」（5.3），但视频里讲者明确说明：\textbf{分布式部分不在本课程范围内}（图~\ref{fig:p5-scope}），他原本计划讲、后来决定不讲。因此本讲实现的是\textbf{单机 MoE 模块}：路由、门控、辅助损失、与前向的 token 展平/还原。
+
+\begin{knowledgebox}{视频未覆盖、但面试常问的三个 MoE 概念（补充背景，非本讲内容）}
+(1) \textbf{capacity factor}：每个专家能接收的 token 上限 = 容量因子 $\times$ 平均分配量；超出容量的 token 会被丢弃或走残差（token dropping）——这是 Switch Transformer 工程实现里的重要机制，本讲代码没有实现。(2) \textbf{专家并行（expert parallelism）}：专家分布在不同设备上，token 需要 all-to-all 通信才能在对应设备上计算，这是 MoE 训练/推理的主要通信开销来源。(3) \textbf{训练与推理的差异}：训练时一个 batch 内 token 多、路由统计稳定；推理时 batch 小、负载波动大，工程上常需要 capacity 上限与路由缓存等优化。这些都不在本讲代码范围内，回答面试时要区分「本讲实现」与「原论文/工程实现」。
+\end{knowledgebox}
+
+\subsection{本章小结}
+\begin{enumerate}
+\item MoE 把 Transformer 的 FFN 换成「路由器 + 多个专家 MLP」：总参数随专家数增加，但每个 token 只激活 top-$k$ 个专家，用稀疏激活换容量与吞吐。
+\item 门控就是一个 \texttt{Linear(dim, n\_expert)} + softmax + \texttt{topk}；专家是结构相同、参数独立的 MLP（本讲用「乘数 4」的隐藏层）。
+\item MoE 前向的关键工程是把 $(B,T,C)$ 展平成 token 流 $(S,C)$ 再还原；路由按 token 独立决策，按索引把激活填回对应专家。
+\item 负载均衡靠辅助损失 $\mathcal{L}_{\text{aux}}=E\sum_i f_iP_i$：$P_i$ 是平均路由概率（importance），$f_i$ 是被硬分配到专家的 token 比例（load）；它抑制「名人问题」，防止路由塌缩到少数专家。
+\item demo 的 6 token / 4 专家例子给出具体数字：probability 矩阵、importance 约 0.24--0.27、load 计数 $[1,2,2,1]$、$\mathcal{L}_{\text{aux}}\approx1.0034$；越不平衡辅助损失越大（手算例约 1.3034）。
+\item 可以用 $\alpha$ 把 MoE 与稠密 FFN 混合（$y=\alpha\,\mathrm{MoE}+(1-\alpha)\,\mathrm{DenseFFN}$），在本讲默认等权；分布式训练与 capacity factor 不在本讲范围内。
+\end{enumerate}

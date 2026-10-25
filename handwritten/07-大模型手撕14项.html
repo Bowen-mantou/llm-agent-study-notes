@@ -1,0 +1,642 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
+<title>大模型手撕 14 项速查手册</title>
+<style>
+body{font-family:-apple-system,"Microsoft YaHei",sans-serif;max-width:1000px;margin:0 auto;padding:24px;line-height:1.7;color:#222}
+h1{border-bottom:3px solid #1a73e8;padding-bottom:8px}
+h2{border-left:5px solid #1a73e8;padding-left:10px;margin-top:36px}
+h3{margin-top:22px;color:#333}
+pre{background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:12px;overflow-x:auto;font-size:13.5px}
+code{font-family:Consolas,"Courier New",monospace}
+.tip{background:#fff8e1;border-left:4px solid #f9a825;padding:10px 14px;margin:10px 0;border-radius:4px}
+.pattern{background:#e8f5e9;border-left:4px solid #43a047;padding:10px 14px;margin:14px 0;border-radius:4px}
+table{border-collapse:collapse;margin:10px 0}th,td{border:1px solid #ccc;padding:6px 12px}th{background:#f0f4f8}
+</style>
+<!-- dsh-site-enhancer:css -->
+<link rel="stylesheet" href="assets/site.css">
+</head><body class="ds-has-topbar" data-site-root="." data-prev-href="06-ML手写与概率.html" data-prev-title="专题6 · ML 手写与概率">
+<h1>大模型手撕 14 项速查手册</h1>
+
+<div class="tip"><b>使用说明</b>：14 项全部为独立题目，代码均已在 numpy 2.4 / PyTorch 2.6 实跑验证（共 32 项断言全部通过，含 numpy↔torch 对照、梯度方向检查）。<b>复习节奏</b>：每天默 3 题（先默框架再看细节）+ 睡前过一遍「追问」；面试前按文末打卡表逐项验收。标签含义：【必默】= 白板能直接写出来；【会讲】= 能讲清思路 + 写出核心几行。</div>
+
+<p><b>目录</b>：
+<a href="#i1">① MHA</a> · <a href="#i2">② RoPE</a> · <a href="#i3">③ KV-Cache</a> · <a href="#i4">④ GQA/MQA</a> · <a href="#i5">⑤ RMSNorm</a> · <a href="#i6">⑥ Top-p 采样</a> · <a href="#i7">⑦ LoRA★</a> · <a href="#i8">⑧ DoRA★</a> · <a href="#i9">⑨ SFT loss mask★</a> · <a href="#i10">⑩ DPO★</a> · <a href="#i11">⑪ PPO clip★</a> · <a href="#i12">⑫ GRPO★</a> · <a href="#i13">⑬ Top-p 精简</a> · <a href="#i14">⑭ K-Means</a> · <a href="#checklist">打卡表</a></p>
+
+<h2 id="i1">① Multi-Head Attention（手写完整版）【必默】</h2>
+<p><b>面试开场</b>：「面试官说：手写下 attention，完整的 multi-head 版本，用 numpy。」</p>
+<div class="tip"><b>要手撕完整 Transformer？</b>先看 <a href="09-手撕Transformer速成.html">手撕 Transformer 速成（面试白板版）</a>：5 个必背公式 → 白板默写顺序 → FFN / pre-LN block / encoder-decoder 可跑代码 → 必背追问。本条目只覆盖 MHA 本身。</div>
+<h3 id="h3-1">代码（可跑）</h3>
+<pre><code>import numpy as np
+import torch
+import torch.nn.functional as F
+
+def softmax_np(x, axis=-1):
+    x = x - x.max(axis=axis, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=axis, keepdims=True)
+
+def mha_numpy(X, Wq, Wk, Wv, Wo, n_heads, mask=None):
+    """X:(B,T,d)  Wq/Wk/Wv/Wo:(d,d)  mask:(1,1,T,T) 或 (B,1,T,T)，屏蔽位=-inf"""
+    B, T, d = X.shape
+    hd = d // n_heads
+    def heads(M):
+        return M.reshape(B, T, n_heads, hd).transpose(0, 2, 1, 3)   # (B,H,T,hd)
+    Q, K, V = heads(X @ Wq), heads(X @ Wk), heads(X @ Wv)
+    scores = Q @ K.transpose(0, 1, 3, 2) / np.sqrt(hd)              # 缩放点积
+    if mask is not None:
+        scores = scores + mask                                      # -inf 屏蔽
+    attn = softmax_np(scores, axis=-1)
+    out = (attn @ V).transpose(0, 2, 1, 3).reshape(B, T, d)
+    return out @ Wo
+
+# ---- 自测：与 PyTorch（同一套权重）对照 ----
+B, T, d, H = 2, 5, 8, 2
+rng = np.random.default_rng(0)
+X = rng.standard_normal((B, T, d)).astype(np.float32)
+Wq, Wk, Wv, Wo = [rng.standard_normal((d, d)).astype(np.float32) for _ in range(4)]
+mask = np.triu(np.full((T, T), -np.inf), k=1)[None, None]          # 因果 mask
+out_np = mha_numpy(X, Wq, Wk, Wv, Wo, H, mask)
+
+tX = torch.from_numpy(X)
+tQ = (tX @ torch.from_numpy(Wq)).view(B, T, H, d // H).transpose(1, 2)
+tK = (tX @ torch.from_numpy(Wk)).view(B, T, H, d // H).transpose(1, 2)
+tV = (tX @ torch.from_numpy(Wv)).view(B, T, H, d // H).transpose(1, 2)
+tmask = torch.triu(torch.full((T, T), float("-inf")), diagonal=1)
+attn_t = torch.softmax(tQ @ tK.transpose(2, 3) / np.sqrt(d // H) + tmask, dim=-1)
+out_t = (attn_t @ tV).transpose(1, 2).reshape(B, T, d) @ torch.from_numpy(Wo)
+assert np.allclose(out_np, out_t.numpy(), atol=1e-5)               # 通过
+
+# 加分项：与官方 F.scaled_dot_product_attention 对照（训练实际走 Flash/SDPA）
+out_sdpa = F.scaled_dot_product_attention(tQ, tK, tV, attn_mask=tmask)
+out_sdpa = out_sdpa.transpose(1, 2).reshape(B, T, d) @ torch.from_numpy(Wo)
+assert np.allclose(out_np, out_sdpa.numpy(), atol=1e-4)            # 通过</code></pre>
+<h3 id="h3-2">关键理解点</h3>
+<ul>
+<li><b>为什么除以 √d_k</b>：d_k 越大 q·k 方差越大（各分量独立时方差约等于 d_k），softmax 输入过大 → 分布饱和、梯度消失；除以 √d_k 把方差压回 O(1)。</li>
+<li><b>mask 怎么加</b>：softmax 之前 scores += mask，被屏蔽位置置 -inf，exp 后为 0；因果 mask 即上三角 -inf。padding mask 同理（按 key 位置屏蔽）。</li>
+<li><b>复杂度</b>：注意力矩阵 O(T²·d)；分头不改变总计算量（H × T² × d/H），只增加表达多样性。长序列靠 FlashAttention / KV Cache 降本。</li>
+</ul>
+<h3 id="h3-3">追问 2 条</h3>
+<div class="tip"><b>Q：为什么分成多个头，不直接一整块算？</b>A：不同子空间并行捕捉不同关系（句法/语义/指代）；总参数量不变（每头维度 d/H），总计算量不变，但表达力更强。</div>
+<div class="tip"><b>Q：softmax 之前为什么要减去 max？</b>A：数值稳定，防止 exp 上溢；softmax 对常数平移不变，减 max 不改变结果。</div>
+
+<h2 id="i2">② RoPE 旋转位置编码【必默】</h2>
+<p><b>面试开场</b>：「面试官说：写一下 RoPE，讲讲它为什么能表达相对位置。」</p>
+<h3 id="h3-4">代码（可跑）</h3>
+<pre><code>import numpy as np
+
+def rope_rotary(x, base=10000.0):
+    """旋转矩阵形式：x:(T,d)，相邻两维配对旋转 θ_i = pos / base^(2i/d)"""
+    T, d = x.shape
+    pos = np.arange(T)[:, None]
+    i = np.arange(d // 2)
+    theta = pos / base ** (2 * i / d)                    # (T, d/2) 逐对角度
+    cos, sin = np.cos(theta), np.sin(theta)
+    x_ = x.reshape(T, d // 2, 2)
+    out = np.empty_like(x_)
+    out[..., 0] = x_[..., 0] * cos - x_[..., 1] * sin    # 2×2 旋转矩阵
+    out[..., 1] = x_[..., 0] * sin + x_[..., 1] * cos
+    return out.reshape(T, d)
+
+def rope_complex(x, base=10000.0):
+    """高效复指数形式：相邻两维打包成复数，乘 e^{iθ}"""
+    T, d = x.shape
+    pos = np.arange(T)
+    i = np.arange(d // 2)
+    theta = pos[:, None] / base ** (2 * i / d)
+    z = (x[:, 0::2] + 1j * x[:, 1::2]) * np.exp(1j * theta)
+    return np.stack([z.real, z.imag], axis=-1).reshape(T, d)
+
+def rope_at(x, pos):
+    """x:(d,) 在任意位置 pos（可为负）上的旋转 —— 用于验证相对位置性质"""
+    d = x.shape[-1]
+    theta = np.asarray(pos) / 10000.0 ** (2 * np.arange(d // 2) / d)
+    c, s = np.cos(theta), np.sin(theta)
+    x_ = x.reshape(d // 2, 2)
+    out = np.empty_like(x_)
+    out[:, 0] = x_[:, 0] * c - x_[:, 1] * s
+    out[:, 1] = x_[:, 0] * s + x_[:, 1] * c
+    return out.reshape(d)
+
+# 自测 1：两种实现等价
+rng = np.random.default_rng(0)
+x = rng.standard_normal((6, 8))
+assert np.allclose(rope_rotary(x), rope_complex(x), atol=1e-9)      # 通过
+
+# 自测 2：相对位置性质 —— 内积 &lt;R_m·q, R_n·k&gt; 只依赖 (n-m)
+q, k = rng.standard_normal((6, 8)), rng.standard_normal((6, 8))
+for m in range(6):
+    for n in range(6):
+        a = rope_at(q[m], m) @ rope_at(k[n], n)
+        b = q[m] @ rope_at(k[n], n - m)
+        assert np.allclose(a, b, atol=1e-9)                          # 通过</code></pre>
+<h3 id="h3-5">关键理解点</h3>
+<ul>
+<li><b>为什么是相对位置</b>：绝对位置编码加在 token 上，内积展开后位置信息是「绝对」的；RoPE 把位置乘进 q/k（旋转），旋转矩阵满足 R_mᵀ·R_n = R_{n-m}，内积只含 (n-m) → 天然相对位置。</li>
+<li><b>多尺度</b>：θ_i = pos / 10000^(2i/d)，低维旋转慢、高维旋转快，不同维度覆盖不同距离尺度的位置关系。</li>
+<li><b>工程实现</b>：实际用 cos/sin 拼接或复数乘法（复指数形式更高效）；长上下文用 NTK / YaRN 调大 base 做外推。</li>
+</ul>
+<h3 id="h3-6">追问 2 条</h3>
+<div class="tip"><b>Q：为什么只旋转 q 和 k，不旋转 v？</b>A：位置信息只需要进入注意力打分 q·k；v 承载内容语义，旋转会污染输出（v 的信息要原样搬到下一层）。</div>
+<div class="tip"><b>Q：RoPE 和 ALiBi 的区别？</b>A：RoPE 是乘性旋转，位置信息无损可逆；ALiBi 是加性偏置（按距离线性衰减加到 mask 上），免训练长度外推，但位置表达力弱一些。</div>
+
+<h2 id="i3">③ KV-Cache：显存手算 + 推理循环【必默】</h2>
+<p><b>面试开场</b>：「面试官问：7B 模型、2K 上下文、batch 8，KV cache 多大？再写一下带 cache 的推理循环。」</p>
+<h3 id="h3-7">代码（可跑 + 伪代码）</h3>
+<div class="tip"><b>运行提示</b>：本块 <b>① 显存手算</b> 部分可直接运行（输出 0.524 MB/token、8.59 GB）；<b>② 推理循环</b> 是伪代码示意（引用未定义变量 <code>model</code>/<code>max_len</code> 等），<b>不要整块复制运行</b>，面试口述用。</div>
+<pre><code># ---- ① 显存手算（通式：2 × L × H_kv × d_head × 字节数 × 总 token 数）----
+L, H_kv, d_head, nbytes = 32, 32, 128, 2      # LLaMA-2-7B：32 层、32 KV 头、头维 128、fp16
+per_token = 2 * L * H_kv * d_head * nbytes    # K、V 各一份
+print(f"每 token: {per_token / 1e6:.3f} MB")  # 0.524 MB/token
+total_tokens = 8 * 2048                       # batch 8 × 2K 上下文
+print(f"总计: {per_token * total_tokens / 1e9:.2f} GB")   # 8.59 GB
+# 对比：7B 模型 fp16 权重本身约 14 GB —— KV cache 已占一半以上
+
+# ---- ② 推理循环伪代码（自回归 + KV Cache）----
+past_kv = None                    # 每层缓存 (K, V)，形状 (B, H_kv, t, d_head)
+for t in range(max_len):
+    if t == 0:
+        # prefill：整段 prompt 并行算，K/V 写入 cache；mask 为完整因果上三角 (T, T)
+        logits, past_kv = model(prompt, past_kv, causal_mask=(T, T))
+    else:
+        # decode：每步只算当前 1 个 token
+        x_t = tokens[:, t:t+1]
+        # 每层 attention：K,V = cat([K_cache, K_new], dim=2)，Q 只有 1 个新 token
+        # 因果 mask 的用法：当前 query 位于最后一位，能看到 cache 里的全部位置
+        #   → 新 token 的 mask 全 0（无需屏蔽）；「旧 token 之间不可见」已由 cache 保证
+        logits, past_kv = model(x_t, past_kv, causal_mask=None)
+    tokens[:, t+1] = sample(logits[:, -1])    # 采样下一个 token</code></pre>
+<h3 id="h3-8">关键理解点</h3>
+<ul>
+<li><b>显存公式</b>：2（K 和 V）× L × H_kv × d_head × 字节数 × 总 token 数；本例 0.5MB/token × 16384 token ≈ 8.6GB。</li>
+<li><b>增量解码时因果 mask 退化</b>：当前只有 1 个 query，它在最后一位，能看到全部已缓存位置 → 新 token 不需要 mask（或全 0）。</li>
+<li><b>本质是显存换时间</b>：每步 attention 从 O(T²d) 降到 O(Td)（新 token 与全部 K 点积一次，旧 KV 不重算）。</li>
+</ul>
+<h3 id="h3-9">追问 2 条</h3>
+<div class="tip"><b>Q：prefill 和 decode 阶段有什么不同？</b>A：prefill 一次并行吃入全部 prompt（算力密集）；decode 每步只算 1 token（访存密集，瓶颈是读 cache）。vLLM 用 continuous batching 把两者混排提高吞吐。</div>
+<div class="tip"><b>Q：怎么省 KV cache？</b>A：GQA/MQA（见④，KV 头数减少）、KV 量化（FP8/INT4）、paged attention（vLLM 分页管理减少碎片）、MLA（DeepSeek 低秩压缩）。</div>
+
+<h2 id="i4">④ GQA / MQA（分组查询注意力）【必默】</h2>
+<p><b>面试开场</b>：「面试官问：GQA 是什么？MQA 和它什么关系？KV cache 能省多少？」</p>
+<h3 id="h3-10">代码（可跑）</h3>
+<pre><code>import numpy as np
+
+def repeat_kv(kv, n_rep):
+    """kv:(B, H_kv, T, hd) -> (B, H_q, T, hd)：每个 KV 头重复 n_rep 次供 query 头使用"""
+    return np.repeat(kv, n_rep, axis=1)      # torch 写法：kv.repeat_interleave(n_rep, dim=1)
+
+# 自测：形状与分组关系
+B, H_kv, T, hd, n_rep = 2, 2, 3, 4, 4
+kv = np.arange(B * H_kv * T * hd).reshape(B, H_kv, T, hd)
+out = repeat_kv(kv, n_rep)
+assert out.shape == (B, H_kv * n_rep, T, hd)   # 2 个 KV 头扩成 8 个
+assert np.allclose(out[:, 5], kv[:, 1])        # 第 5 个 query 头用第 1 个 KV 头（5 // 4 == 1）
+
+# 显存节省：KV cache 与 H_kv 成正比 → GQA 省 H_q / H_kv 倍
+# 例：LLaMA-2-70B H_q=64、H_kv=8 → 省 8 倍；MQA（H_kv=1）省 64 倍</code></pre>
+<h3 id="h3-11">关键理解点</h3>
+<ul>
+<li><b>核心就一句</b>：H_q 个 query 头分成 H_kv 组，组内共享同一个 KV 头（repeat 复制）；MQA 是 H_kv=1 的极端特例，MHA 是 H_kv=H_q。</li>
+<li><b>省在哪</b>：KV cache 大小与 H_kv 成正比，注意力中 KV 部分的计算/访存同样省；Q 每步现算现用、不缓存，所以不用省。</li>
+<li><b>为什么是折中</b>：MQA 最省但 KV 表达能力受限、质量略降；GQA 在质量与显存之间取中间点（LLaMA-2/3、Mistral 等主流选择）。</li>
+</ul>
+<h3 id="h3-12">追问 2 条</h3>
+<div class="tip"><b>Q：梯度怎么回到共享的 KV 头？</b>A：前向 repeat 出 H_q 份，反向时同一 KV 头的梯度按组求和累加（PyTorch 的 repeat_interleave 自动处理）。</div>
+<div class="tip"><b>Q：为什么 KV 投影可以少而 Q 不行？</b>A：KV 要缓存、要反复读，是显存和访存瓶颈；Q 每步只算当前 token，不是瓶颈。共享 KV 恰好砍在瓶颈上。</div>
+
+<h2 id="i5">⑤ RMSNorm【必默】</h2>
+<p><b>面试开场</b>：「面试官说：写一下 RMSNorm，说说和 LayerNorm 的区别。」</p>
+<h3 id="h3-13">代码（可跑）</h3>
+<pre><code>import numpy as np
+import torch
+
+def rms_norm_np(x, gamma, eps=1e-6):
+    rms = np.sqrt(np.mean(x ** 2, axis=-1, keepdims=True) + eps)   # 均方根
+    return x / rms * gamma
+
+# 自测：与 PyTorch 手写对照
+x = np.random.default_rng(0).standard_normal((2, 3, 8)).astype(np.float32)
+g = np.ones(8, dtype=np.float32)
+out_np = rms_norm_np(x, g)
+t_x = torch.from_numpy(x)
+out_t = t_x / torch.sqrt((t_x ** 2).mean(-1, keepdim=True) + 1e-6) * torch.from_numpy(g)
+assert np.allclose(out_np, out_t.numpy(), atol=1e-6)               # 通过</code></pre>
+<h3 id="h3-14">关键理解点</h3>
+<ul>
+<li><b>与 LayerNorm 的区别</b>：LayerNorm 是 y=(x-μ)/σ·γ+β（减均值 + 除标准差 + 缩放 + 平移）；RMSNorm 只做均方根缩放 y=x/RMS(x)·γ —— 无中心化、无 bias。</li>
+<li><b>为什么能去掉均值</b>：论文论证归一化的收益主要来自「重新伸缩」带来的尺度不变性，减均值的贡献很小；省掉均值统计 → 训练/推理更快、显存略省。</li>
+<li><b>位置</b>：LLaMA/Mistral 系全用 RMSNorm，Pre-Norm 位置与 LayerNorm 相同（attention / FFN 输入前）。</li>
+</ul>
+<h3 id="h3-15">追问 2 条</h3>
+<div class="tip"><b>Q：eps 加在哪？</b>A：开根号之前：RMS = sqrt(mean(x²) + eps)，防止 x 全 0 时除 0（数值稳定性）。</div>
+<div class="tip"><b>Q：可学习参数有哪些？</b>A：只有 γ（每维一个缩放系数），没有 β（bias）。</div>
+
+<h2 id="i6">⑥ Sampling / Top-p 核采样（含 top-k 对比）【必默】</h2>
+<p><b>面试开场</b>：「面试官说：写一下带 temperature 的 top-p 采样，说说和 top-k 的区别。」</p>
+<h3 id="h3-16">代码（可跑）</h3>
+<pre><code>import numpy as np
+
+def softmax_np(x, axis=-1):
+    x = x - x.max(axis=axis, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=axis, keepdims=True)
+
+def top_p_sample_np(logits, temperature=1.0, top_p=0.9, rng=None):
+    """返回一个 token id；核心是「过滤掩码」：累计概率超过 top_p 的长尾全部 mask 掉"""
+    logits = np.asarray(logits, dtype=np.float64) / temperature     # ① temperature 缩放
+    probs = softmax_np(logits)
+    order = np.argsort(probs)[::-1]           # ② 按概率降序
+    sorted_p = probs[order]
+    cum = np.cumsum(sorted_p)                 # ③ 累计概率
+    keep = (cum - sorted_p) &lt; top_p           # ④ 截至自己之前还 &lt; top_p 的保留
+    keep[0] = True                            # 概率最大的必留
+    mask = np.zeros_like(probs, dtype=bool)
+    mask[order[keep]] = True                  # ⑤ 过滤掩码：尾巴位置置 False
+    probs_f = np.where(mask, probs, 0.0)      # ⑥ 屏蔽 + 重新归一化
+    probs_f /= probs_f.sum()
+    rng = rng or np.random.default_rng()
+    return rng.choice(len(probs), p=probs_f), probs_f
+
+# 自测
+logits = np.array([0.1, 2.0, 1.0, 0.3, 0.2, -1.0])
+tok, pf = top_p_sample_np(logits, 1.0, 0.7)
+assert abs(pf.sum() - 1.0) &lt; 1e-12 and pf.min() &gt;= 0          # 归一化合法
+assert set(np.where(pf &gt; 0)[0]) &lt;= {0, 1, 2}                  # top_p=0.7 只留前 2 个
+assert tok in np.where(pf &gt; 0)[0]                              # 采样只落在保留集
+
+# 与 PyTorch 对照（同样的过滤逻辑）
+import torch
+probs_t = torch.softmax(torch.tensor(logits) / 1.0, -1)
+sp, idx = probs_t.sort(descending=True)
+cut = int((sp.cumsum(0) &gt; 0.7).nonzero()[0]) + 1              # 第一个累计超过 top_p 的位置（含）
+keep_t = idx[:cut]
+probs_tf = torch.zeros_like(probs_t); probs_tf[keep_t] = probs_t[keep_t]
+probs_tf /= probs_tf.sum()
+assert np.allclose(pf, probs_tf.numpy(), atol=1e-12)           # 通过
+
+# temperature 效果：T 越大分布越平
+p_hot = softmax_np(logits / 0.1); p_flat = softmax_np(logits / 5.0)
+assert p_hot.max() &gt; p_flat.max()                              # 通过
+
+# top-k 对比：固定保留 k 个
+def top_k_probs(probs, k):
+    order = np.argsort(probs)[::-1]
+    mask = np.zeros_like(probs, dtype=bool); mask[order[:k]] = True
+    p = np.where(mask, probs, 0.0)
+    return p / p.sum()</code></pre>
+<h3 id="h3-17">关键理解点</h3>
+<ul>
+<li><b>五步流程</b>：temperature 缩放 → softmax → 降序累加 → 找第一个使 cumsum 超过 top_p 的位置，之前（含）保留、之后 mask 为 0 → 重新归一化 → 按分布采样。</li>
+<li><b>temperature</b>：T 大于 1 分布变平（更随机、创造性），T 小于 1 变尖（更确定），T→0 趋近贪心；缩放必须在 softmax 之前做。</li>
+<li><b>top-k 对比</b>：top-k 固定个数——分布平坦时截掉有效长尾、尖锐时保留噪音；top-p 按累计质量动态定个数，更稳健。</li>
+</ul>
+<h3 id="h3-18">追问 2 条</h3>
+<div class="tip"><b>Q：为什么要重新归一化？</b>A：截断后概率和小于 1，multinomial / choice 要求合法分布；归一化不改变保留集内部的相对大小。</div>
+<div class="tip"><b>Q：top_p=1.0 和 top_p 极小分别等价于什么？</b>A：top_p=1.0 等价纯 temperature 采样（不截断）；top_p 极小时只剩最大概率 token，趋近贪心解码。</div>
+
+<h2 id="i7">⑦ LoRA 前向（★新增重点）【必默】</h2>
+<p><b>面试开场</b>：「面试官说：手写 LoRA 的前向，讲讲 A、B 怎么初始化、为什么。」</p>
+<div class="pattern"><b>核心公式</b>：W = W₀ + (α/r)·B·A　→　前向 h = W₀·x + (α/r)·B·(A·x)，只有 A、B 有梯度</div>
+<h3 id="h3-19">代码（可跑）</h3>
+<pre><code>import torch
+import torch.nn as nn
+
+class LoRALinear(nn.Module):
+    def __init__(self, in_f, out_f, r=16, alpha=16):
+        super().__init__()
+        self.W0 = nn.Linear(in_f, out_f, bias=False)     # 预训练权重：冻结
+        self.W0.weight.requires_grad_(False)
+        self.A = nn.Parameter(torch.randn(r, in_f) * 0.01)   # A：高斯初始化
+        self.B = nn.Parameter(torch.zeros(out_f, r))         # B：零初始化
+        self.scale = alpha / r
+
+    def forward(self, x):
+        # h = W0·x + (α/r)·B·(A·x)   ← 核心公式
+        return self.W0(x) + self.scale * (x @ self.A.T @ self.B.T)
+
+    def merge(self):                                     # 推理前把增量并回 W0
+        self.W0.weight.data += self.scale * (self.B @ self.A)
+
+    def unmerge(self):
+        self.W0.weight.data -= self.scale * (self.B @ self.A)
+
+# 自测
+torch.manual_seed(0)
+lin = LoRALinear(8, 8, r=4, alpha=8)
+x = torch.randn(2, 8)
+with torch.no_grad():
+    y0 = lin(x).clone()
+    assert torch.allclose(y0, lin.W0(x), atol=1e-6)       # B=0 → 起点输出与预训练完全一致
+    W0_orig = lin.W0.weight.clone()
+    lin.merge()
+    assert torch.allclose(lin.W0(x), y0 + lin.scale * (x @ lin.A.T @ lin.B.T), atol=1e-5)  # merge 等价
+    lin.unmerge()
+    assert torch.allclose(lin.W0.weight, W0_orig, atol=1e-7)   # unmerge 精确还原
+
+# 参数量：r × (in + out)，例 d=4096、r=16
+print(f"LoRA 参数量: {16 * 8192} ≈ 全量的 {16 * 8192 / 4096**2 * 100:.2f}%")   # 131072 ≈ 0.78%</code></pre>
+<h3 id="h3-20">关键理解点</h3>
+<ul>
+<li><b>初始化</b>：A 高斯、B 零 → 训练起点 BA=0，输出与预训练完全一致（零扰动启动）；若 A 也零则梯度恒为 0 训不动。B 零还让 A 的各列从随机方向独立起步。</li>
+<li><b>参数量</b>：r(in+out)（本例 0.78%），optimizer state、梯度通信、checkpoint 同比例省——多卡训练的通信成本主要省在这里。</li>
+<li><b>推理</b>：merge 后 W0+BA 合成单矩阵，零额外延迟；换任务只换 A、B，主干共享。</li>
+</ul>
+<h3 id="h3-21">追问 2 条</h3>
+<div class="tip"><b>Q：α/r 是干什么的？</b>A：α 是缩放超参；写成 α/r 使改变 r 时无需改学习率（r 增大自动摊薄每列贡献）。常用 α=2r 或 α=r。</div>
+<div class="tip"><b>Q：LoRA 加在哪几类矩阵？</b>A：原论文只加 Wq/Wv；LLaMA 系常用 attention 四投影 + FFN 的 gate/up；加得越多越接近全参微调效果。</div>
+
+<h2 id="i8">⑧ DoRA 前向（★新增重点）【必默】</h2>
+<p><b>面试开场</b>：「面试官说：讲讲 DoRA 和 LoRA 的区别，写一下前向。」</p>
+<div class="pattern"><b>核心公式</b>：权重分解 W = m ⊙ V/||V||（幅度 × 单位方向）→ 训练时 W = m · (W₀ + BA) / ||W₀ + BA||，LoRA 只作用在 direction 上</div>
+<h3 id="h3-22">代码（可跑）</h3>
+<pre><code>import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class DoRALinear(nn.Module):
+    def __init__(self, in_f, out_f, r=16, alpha=16):
+        super().__init__()
+        self.W0 = nn.Linear(in_f, out_f, bias=False)   # 预训练权重：冻结
+        self.W0.weight.requires_grad_(False)
+        m0 = self.W0.weight.norm(p=2, dim=1, keepdim=True)   # 每行幅度 ||W0 行||
+        self.m = nn.Parameter(m0)                       # 幅度向量：可学，初始化 ||W0||
+        self.A = nn.Parameter(torch.randn(r, in_f) * 0.01)
+        self.B = nn.Parameter(torch.zeros(out_f, r))
+        self.scale = alpha / r
+
+    def forward(self, x):
+        # ① 方向 = 预训练方向 + LoRA 增量（LoRA 只作用在 direction 上）
+        W_dir = self.W0.weight + self.scale * (self.B @ self.A)
+        # ② 方向按行归一化成单位向量
+        W_dir = F.normalize(W_dir, p=2, dim=1)
+        # ③ W = 幅度 m × 方向（magnitude × direction 分解）
+        return F.linear(x, self.m * W_dir)
+
+# 自测
+torch.manual_seed(0)
+dora = DoRALinear(8, 8, r=4, alpha=8)
+x = torch.randn(2, 8)
+with torch.no_grad():
+    assert torch.allclose(dora(x), dora.W0(x), atol=1e-5)   # 初始化时 m·W0/||W0|| = W0，与 LoRA 同样零扰动
+    W = dora.m * F.normalize(dora.W0.weight + dora.scale * (dora.B @ dora.A), dim=1)
+    assert torch.allclose(W.norm(dim=1), dora.m.flatten(), atol=1e-5)   # 每行范数恒等于 |m|</code></pre>
+<h3 id="h3-23">关键理解点</h3>
+<ul>
+<li><b>权重分解</b>：每行拆成「幅度标量 m」×「单位方向向量」；m 初始化为 ||W0 行||，方向归一化后两者乘积恰好还原 W0（零扰动启动）。</li>
+<li><b>与 LoRA 的区别</b>：LoRA 的 ΔW 把幅度和方向耦合在一起成比例地变；DoRA 解耦——m 独立可学、LoRA 只加在 direction 上，能复现 full fine-tuning 的「幅度-方向负相关」学习模式（LoRA 学不出）。</li>
+<li><b>成本</b>：只多 out_f 个参数（m 向量）；推理时同样可把 m·(W0+BA)/||W0+BA|| 预合成单矩阵，零额外开销。</li>
+</ul>
+<h3 id="h3-24">追问 2 条</h3>
+<div class="tip"><b>Q：「幅度-方向负相关」是什么？</b>A：FT 训练后 W 每行幅度普遍变大、行方向偏离 W0 变大，且两者负相关（幅度涨得多的方向转得少）；LoRA 对幅度和方向成比例更新，学不出这种模式，DoRA 通过分离 m 实现。</div>
+<div class="tip"><b>Q：m 是冻结还是可学？</b>A：论文里可训练（初始化 ||W0||）；简化为冻结 m、只学方向也有不错效果。</div>
+
+<h2 id="i9">⑨ SFT loss mask（★新增重点）【必默】</h2>
+<p><b>面试开场</b>：「面试官说：写一下 SFT 的 loss 计算，padding 怎么处理？」</p>
+<div class="pattern"><b>核心公式</b>：loss = CE( logits[:, :-1] , labels[:, 1:] )，padding 位置 labels 置 -100（ignore_index）</div>
+<h3 id="h3-25">代码（可跑）</h3>
+<pre><code>import torch
+import torch.nn.functional as F
+
+def sft_loss(logits, input_ids, pad_token_id=0):
+    """logits:(B,T,V) 模型对完整序列的输出；input_ids:(B,T) 含 [prompt...answer&lt;EOS&gt;&lt;PAD&gt;...]"""
+    # ① 语言模型是「预测下一个词」：logits 取前 T-1 位，labels 取后 T-1 位（右移一位）
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = input_ids[:, 1:].contiguous()
+    # ② padding 位置置 -100，CE 自动忽略（ignore_index=-100）
+    shift_labels = shift_labels.masked_fill(shift_labels == pad_token_id, -100)
+    # ③ 展平后统一算 CE；-100 位置梯度为 0
+    return F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)),
+                           shift_labels.view(-1), ignore_index=-100)
+    # 若只想训 answer 部分（不算 prompt）：shift_labels[:, :prompt_len-1] = -100
+
+# 自测
+torch.manual_seed(0)
+V = 10
+logits = torch.randn(2, 4, V)
+ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]])      # 末尾 0 是 pad
+loss = sft_loss(logits, ids)
+
+# 对照：逐个有效位置手算平均
+total, cnt = 0.0, 0
+for b in range(2):
+    for t in range(3):
+        if ids[b, t + 1] != 0:
+            total += F.cross_entropy(logits[b, t].unsqueeze(0), ids[b, t + 1:t + 2]).item()
+            cnt += 1
+assert abs(loss.item() - total / cnt) &lt; 1e-6          # 通过
+
+# padding 位置的 logits 随便扰动，loss 不变
+logits2 = logits.clone(); logits2[1, 2] = torch.randn(V) * 100
+assert abs(sft_loss(logits2, ids).item() - loss.item()) &lt; 1e-6   # 通过
+
+# 全预测对 → loss ≈ 0
+logits3 = torch.full((1, 3, V), -100.0); logits3[:, 0, 2] = 100.0
+ids3 = torch.tensor([[1, 2, 0]])                      # 右移后 labels = [2, -100]
+assert sft_loss(logits3, ids3).item() &lt; 1e-3          # 通过</code></pre>
+<h3 id="h3-26">关键理解点</h3>
+<ul>
+<li><b>核心是「错位对齐」</b>：位置 t 的 logits 预测位置 t+1 的 token → logits[:, :-1] 对 labels[:, 1:]，长度对齐到 T-1。</li>
+<li><b>-100 的约定</b>：PyTorch cross_entropy 的 ignore_index，HuggingFace 全系沿用；被忽略位置既不产生 loss 也不产生梯度。</li>
+<li><b>mask 什么</b>：必须 mask padding（人为填充，不是要学的内容）；通常也 mask prompt（只算 answer 的 loss）。</li>
+</ul>
+<h3 id="h3-27">追问 2 条</h3>
+<div class="tip"><b>Q：输入侧怎么构造？</b>A：两种等价写法——① input_ids 直接进模型，loss 里做右移；② 显式 input_ids[:, :-1] 进模型、labels[:, 1:] 对齐。② 省一次最后位置的无效计算。</div>
+<div class="tip"><b>Q：为什么 -100 而不是别的值？</b>A：任意不在词表 [0, V-1] 内的值配合 ignore_index 都行，-100 只是 HF 社区惯例。</div>
+
+<h2 id="i10">⑩ DPO loss（★新增重点）【必默】</h2>
+<p><b>面试开场</b>：「面试官说：写出 DPO 的 loss 公式和代码。」</p>
+<div class="pattern"><b>核心公式</b>：L = -log σ( β·[ log πθ(c)/πθ(r) - log πref(c)/πref(r) ] )，本质是对偏好对 (chosen, rejected) 的二分类</div>
+<h3 id="h3-28">代码（可跑）</h3>
+<pre><code>import torch
+import torch.nn.functional as F
+
+def dpo_loss(pi_logps_c, pi_logps_r, ref_logps_c, ref_logps_r, beta=0.1):
+    """四个输入都是 (B,)：chosen/rejected 在 πθ 与 πref 下的平均 log 概率"""
+    pi_ratio = pi_logps_c - pi_logps_r        # log πθ(c)/πθ(r)
+    ref_ratio = ref_logps_c - ref_logps_r     # log πref(c)/πref(r)
+    logits = beta * (pi_ratio - ref_ratio)    # 隐式奖励差 × β
+    return -F.logsigmoid(logits).mean()       # L = -log σ(·)
+
+# 自测：chosen 相对概率越高，loss 越小
+base = torch.randn(4)
+l1 = dpo_loss(base, base, base, base)             # πθ == πref → log σ(0) ≈ 0.693
+l2 = dpo_loss(base + 1.0, base, base, base)       # chosen 概率提高
+l3 = dpo_loss(base - 1.0, base, base, base)       # chosen 概率降低
+assert l2.item() &lt; l1.item() and l1.item() &lt; l3.item()   # 通过
+
+# 梯度方向：提高 chosen logp → loss 下降
+pi_c = torch.randn(3, requires_grad=True)
+loss = dpo_loss(pi_c, torch.randn(3), torch.randn(3), torch.randn(3))
+loss.backward()
+assert (pi_c.grad &lt; 0).all().item()               # 通过</code></pre>
+<h3 id="h3-29">关键理解点</h3>
+<ul>
+<li><b>一句话与 RLHF 对比</b>：RLHF 是三步（训 reward model → 用 PPO 优化策略）；DPO 把奖励重参数化为 r(x,y)=β·log(πθ/πref)，代入 Bradley-Terry 偏好模型后 reward model 被消掉 → 直接用偏好对做分类式优化，免 RM、免在线采样。</li>
+<li><b>实现注意</b>：πref 冻结、不参与梯度；logps 先按 token 平均、再按 batch 平均。</li>
+</ul>
+<h3 id="h3-30">追问 2 条</h3>
+<div class="tip"><b>Q：β 的作用？</b>A：控制偏离 πref 的力度（隐式 KL 约束）：β 大 → 保守贴 ref；β 小 → 激进拟合偏好。RLHF 里它对应 KL 惩罚系数。</div>
+<div class="tip"><b>Q：DPO 的缺点？</b>A：离线数据 + 分布外偏好容易过拟合（把 chosen 概率单调推到 1）；缓解：迭代 DPO（用新策略重新采样偏好对）。</div>
+
+<h2 id="i11">⑪ PPO clip（★新增重点）【必默】</h2>
+<p><b>面试开场</b>：「面试官说：写出 PPO 的 clipped surrogate objective，解释为什么用 min。」</p>
+<div class="pattern"><b>核心公式</b>：L = -E[ min( r·A , clip(r, 1-ε, 1+ε)·A ) ]，r = πθ/π_old</div>
+<h3 id="h3-31">代码（可跑）</h3>
+<pre><code>import torch
+
+def ppo_clip_loss(logp_new, logp_old, advantage, clip_eps=0.2):
+    ratio = torch.exp(logp_new - logp_old)              # r(θ) = πθ / π_old
+    surr1 = ratio * advantage                           # 原始策略梯度项
+    surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantage   # 截断项
+    return -torch.min(surr1, surr2).mean()              # 目标：max E[min(·, ·)]
+
+# 自测 1：ratio 在 [1-ε, 1+ε] 内 → 退化为普通策略梯度
+logp_old = torch.tensor([0.0, 0.0])
+A = torch.tensor([1.0, -1.0])
+logp_new = torch.tensor([0.1, -0.1])                   # ratio ≈ 1.105 / 0.905，未越界
+r_ = torch.exp(logp_new - logp_old)
+assert torch.allclose(ppo_clip_loss(logp_new, logp_old, A), -(r_ * A).mean(), atol=1e-6)  # 通过
+
+# 自测 2：越界后被 clip，梯度为 0（不再继续更新）
+logp_new2 = torch.tensor([0.5, -0.5], requires_grad=True)   # ratio 1.65 / 0.61 越界
+loss = ppo_clip_loss(logp_new2, logp_old, A)
+loss.backward()
+assert torch.allclose(logp_new2.grad, torch.zeros(2), atol=1e-6)   # 通过</code></pre>
+<h3 id="h3-32">关键理解点</h3>
+<ul>
+<li><b>目标</b>：max E[ min(r·A, clip(r, 1-ε, 1+ε)·A) ]；A 大于 0 时 r 上限 1+ε，A 小于 0 时下限 1-ε。</li>
+<li><b>为什么 min（保守更新）</b>：一旦 r 越出区间，min 取到 clip 项（对 θ 是常数），梯度归零，策略不再朝同一方向继续推概率 → 近似信任域（TRPO 的简化）。</li>
+<li><b>配套</b>：A 一般用 GAE 估计（λ 平衡偏差/方差），critic V(s) 提供基线。</li>
+</ul>
+<h3 id="h3-33">追问 2 条</h3>
+<div class="tip"><b>Q：clip 什么时候生效？</b>A：新旧策略「同向且步子过大」时：A 大于 0 且 r 超过 1+ε，或 A 小于 0 且 r 低于 1-ε；生效即梯度截断。</div>
+<div class="tip"><b>Q：和 TRPO 的关系？</b>A：TRPO 用 KL 硬约束 + 二阶优化（共轭梯度），实现重；PPO 用 clip 做一阶近似，简单有效，成为 RLHF 默认算法。</div>
+
+<h2 id="i12">⑫ GRPO（★新增重点）【必默】</h2>
+<p><b>面试开场</b>：「面试官说：GRPO 的 loss 怎么写？和 PPO 有什么区别？为什么不需要 critic？」</p>
+<div class="pattern"><b>核心公式</b>：A_i = (r_i - mean(r)) / std(r)（组内标准化）→ L = -E[ min(r·A, clip(r)·A) - β·KL ]</div>
+<h3 id="h3-34">代码（可跑）</h3>
+<pre><code>import torch
+
+def grpo_loss(logp_new, logp_old, rewards, ref_logp=None, beta=0.04, clip_eps=0.2):
+    """logp_new/logp_old/rewards: (G,) —— 同一 prompt 采样 G 条响应，
+       每条响应的 (新 logπθ、旧 logπ、规则得分) 均已按 token 平均"""
+    # ① 组内标准化优势：组均值即基线，不需要 critic
+    A = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+    # ② 与 PPO 相同的 clip 目标
+    ratio = torch.exp(logp_new - logp_old)
+    surr = torch.min(ratio * A, torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * A)
+    # ③ KL 惩罚（简化低方差估计：log πref - log πθ）
+    if ref_logp is not None:
+        return -(surr - beta * (ref_logp - logp_new)).mean()
+    return -surr.mean()
+
+# 自测 1：标准化后优势均值为 0、std 为 1
+r = torch.tensor([1.0, 2.0, 3.0, 4.0])
+A = (r - r.mean()) / (r.std() + 1e-8)
+assert abs(A.mean().item()) &lt; 1e-5 and abs(A.std().item() - 1.0) &lt; 1e-5   # 通过
+
+# 自测 2：得分高于组均值的响应被抬高、低于的被压低
+G = 4
+logp_old = torch.zeros(G)
+rewards = torch.tensor([0.0, 0.0, 0.0, 1.0])       # 最后一条最好
+logp_new = torch.zeros(G, requires_grad=True)
+loss = grpo_loss(logp_new, logp_old, rewards)
+loss.backward()
+assert logp_new.grad[3].item() &lt; 0 and logp_new.grad[0].item() &gt; 0   # 通过</code></pre>
+<h3 id="h3-35">关键理解点</h3>
+<ul>
+<li><b>优势估计</b>：同一 prompt 采 G 条响应，A_i=(r_i-mean)/std（组内标准化）——组均值就是基线，替代 PPO 的 V(s) 基线。</li>
+<li><b>为什么不需要 critic</b>：组内比较天然是相对打分，规则 reward（数学题对错、格式检查）足够；省掉 critic 网络 → 省一半训练显存与时间（DeepSeek-R1 用 GRPO 的核心动机）。</li>
+<li><b>与 PPO 的区别</b>：目标主体（clip + KL）相同，只换了优势估计方式：PPO 用 GAE + critic，GRPO 用组内标准化。</li>
+</ul>
+<h3 id="h3-36">追问 2 条</h3>
+<div class="tip"><b>Q：G 取多少？</b>A：常见 8~16，DeepSeekMath 用 64；G 越大优势估计方差越小，但采样成本越高。</div>
+<div class="tip"><b>Q：GRPO 的 KL 更严谨怎么算？</b>A：DeepSeek 用无偏估计器 k3 = exp(r_ref - r_θ) - (r_ref - r_θ) - 1，其中 r 是 log ratio；手撕写简化版 log πref - log πθ 即可。</div>
+
+<h2 id="i13">⑬ Top-p 采样（精简版，完整版见 ⑥）【会讲】</h2>
+<p><b>面试开场</b>：「面试官说：top-p 用 torch 写个精简版就行。」</p>
+<h3 id="h3-37">代码（可跑）</h3>
+<pre><code>import torch
+
+def sample_top_p(logits, t=1.0, p=0.9):
+    probs = torch.softmax(logits / t, -1)              # temperature 缩放 + softmax
+    sp, idx = probs.sort(descending=True)              # 降序
+    cum = sp.cumsum(0)
+    cut = int((cum &gt; p).nonzero()[0]) + 1             # 第一个累计超过 p 的位置（含）
+    keep = idx[:cut]                                   # 尾巴 mask 掉
+    sp = sp[:cut] / sp[:cut].sum()                     # 重新归一化
+    return keep[torch.multinomial(sp, 1)].item()       # 按过滤后分布采样
+
+torch.manual_seed(0)
+logits = torch.tensor([0.1, 1.0, 2.0, 0.3, 0.2])
+tok = sample_top_p(logits, t=1.0, p=0.7)
+assert tok in [2, 1]                                   # p=0.7 只保留概率最大的 2 个</code></pre>
+<h3 id="h3-38">关键理解点</h3>
+<ul>
+<li>截断点 = cumsum 第一个超过 p 的位置（含）；截断点之后全部 mask，再归一化、multinomial。</li>
+<li>理解点与追问同 ⑥（temperature 次序、与 top-k 的区别）。</li>
+</ul>
+<h3 id="h3-39">追问 2 条</h3>
+<div class="tip"><b>Q：为什么截断点要「含」？</b>A：保证保留集累计概率达到 p 左右（至少覆盖 top_p 质量）；若不含，保留集可能明显小于 p。</div>
+<div class="tip"><b>Q：p=0.9 与 p=0.99 的区别？</b>A：p 越大长尾保留越多、多样性越高但引入低概率噪音；p 越小越确定。</div>
+
+<h2 id="i14">⑭ K-Means【必默】</h2>
+<p><b>面试开场</b>：「面试官说：写个 K-Means，从初始化到收敛。」</p>
+<h3 id="h3-40">代码（可跑）</h3>
+<pre><code>import numpy as np
+
+def kmeans(X, k, iters=100, seed=0):
+    rng = np.random.default_rng(seed)
+    centers = X[rng.choice(len(X), k, replace=False)]       # ① 初始化：随机选 k 个点
+    for _ in range(iters):
+        # ② 分配：每个点归到最近中心
+        dist = ((X[:, None, :] - centers[None, :, :]) ** 2).sum(-1)   # (N, k)
+        labels = dist.argmin(-1)
+        # ③ 更新：中心 = 所属点均值
+        new_centers = np.array([X[labels == j].mean(axis=0) for j in range(k)])
+        # ④ 收敛判断：中心不再变化
+        if np.allclose(centers, new_centers, atol=1e-8):
+            break
+        centers = new_centers
+    return centers, labels
+
+# 自测：3 个高斯簇 → 恢复真实中心
+rng = np.random.default_rng(42)
+true_c = np.array([[0, 0], [5, 5], [-5, 5]], dtype=float)
+X = np.vstack([rng.normal(c, 0.3, (50, 2)) for c in true_c])
+centers, labels = kmeans(X, k=3, seed=1)
+err = sorted(np.linalg.norm(centers - true_c, axis=1))
+assert err[-1] &lt; 0.5                                    # 通过（误差 ~0.03）
+# 注意：随机初始化可能陷入局部最优（两个中心掉进同一簇），换 seed 或多跑几次</code></pre>
+<h3 id="h3-41">关键理解点</h3>
+<ul>
+<li><b>三步循环</b>：分配（最近中心）→ 更新（簇内均值）→ 收敛判断；每步都在降低簇内平方和（SSE），所以必收敛。</li>
+<li><b>初始化敏感</b>：随机选点可能陷入局部最优——工程上用 k-means++（按距离平方加权选初始中心）。</li>
+<li><b>复杂度</b>：O(N·k·d) 每轮；k 的选择用肘部法或轮廓系数。</li>
+</ul>
+<h3 id="h3-42">追问 2 条</h3>
+<div class="tip"><b>Q：会收敛吗？是全局最优吗？</b>A：SSE 每步单调下降且数据划分有限 → 必收敛到某个局部最优；多跑几次取 SSE 最小。</div>
+<div class="tip"><b>Q：空簇怎么办？</b>A：随机重选一个数据点作为该簇的新中心（工程实现里的兜底）。</div>
+
+<h2 id="checklist">附录：14 项自查打卡表</h2>
+<table>
+<tr><th>#</th><th>题目</th><th>会默写？</th><th>能讲清理解点？</th><th>追问能答？</th></tr>
+<tr><td>①</td><td>Multi-Head Attention【必默】</td><td>□</td><td>□</td><td>□</td></tr>
+<tr><td>②</td><td>RoPE【必默】</td><td>□</td><td>□</td><td>□</td></tr>
+<tr><td>③</td><td>KV-Cache 显存 + 推理循环【必默】</td><td>□</td><td>□</td><td>□</td></tr>
+<tr><td>④</td><td>GQA / MQA【必默】</td><td>□</td><td>□</td><td>□</td></tr>
+<tr><td>⑤</td><td>RMSNorm【必默】</td><td>□</td><td>□</td><td>□</td></tr>
+<tr><td>⑥</td><td>Sampling / Top-p（含 top-k）【必默】</td><td>□</td><td>□</td><td>□</td></tr>
+<tr><td>⑦</td><td>LoRA forward ★【必默】</td><td>□</td><td>□</td><td>□</td></tr>
+<tr><td>⑧</td><td>DoRA forward ★【必默】</td><td>□</td><td>□</td><td>□</td></tr>
+<tr><td>⑨</td><td>SFT loss mask ★【必默】</td><td>□</td><td>□</td><td>□</td></tr>
+<tr><td>⑩</td><td>DPO loss ★【必默】</td><td>□</td><td>□</td><td>□</td></tr>
+<tr><td>⑪</td><td>PPO clip ★【必默】</td><td>□</td><td>□</td><td>□</td></tr>
+<tr><td>⑫</td><td>GRPO ★【必默】</td><td>□</td><td>□</td><td>□</td></tr>
+<tr><td>⑬</td><td>Top-p 精简版【会讲】</td><td>□</td><td>□</td><td>□</td></tr>
+<tr><td>⑭</td><td>K-Means【必默】</td><td>□</td><td>□</td><td>□</td></tr>
+</table>
+<p><b>打卡规则</b>：三列全 □→✓ 才算过一项；考前 3 天只复习「追问」列。★ 项为近期新增重点（LoRA/DoRA/SFT/DPO/PPO/GRPO），优先默写。</p>
+<!-- dsh-site-enhancer:js -->
+<script src="assets/site.js"></script>
+</body></html>
